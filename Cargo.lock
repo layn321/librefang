@@ -4795,6 +4795,7 @@ dependencies = [
 name = "librefang-llm-drivers"
 version = "2026.11.11"
 dependencies = [
+ "agent-client-protocol",
  "async-trait",
  "base64 0.23.1",
  "chrono",
@@ -4820,7 +4821,9 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
+ "tracing-core",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",

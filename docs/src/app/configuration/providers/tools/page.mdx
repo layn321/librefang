@@ -13,6 +13,7 @@ This page covers providers that integrate through local assistant tooling or CLI
 - Codex CLI
 - Gemini CLI
 - Qwen Code
+- Claude Code and Codex over ACP
 
 ## CLI logins as first-class default providers
 
@@ -229,3 +230,72 @@ model = "kimi-coder"
 3. No additional LibreFang configuration needed
 
 **Notes:** CLI Provider — LibreFang spawns the `qwen` binary as a subprocess in print mode (`-p`). The driver preserves `QWEN_*` environment variables while stripping other providers' secrets. Supports streaming JSON output from the Qwen Code CLI. No separate API key is needed when using Qwen OAuth authentication.
+
+---
+
+## Claude Code and Codex over ACP
+
+| | |
+|---|---|
+| **Provider IDs** | `claude-code-acp`, `codex-acp` (aliases `claude_code_acp`, `codex_acp`) |
+| **Type** | **CLI Provider** (ACP client) |
+| **Driver** | `acp_client`: LibreFang is the [Agent Client Protocol](https://agentclientprotocol.com) client |
+| **Adapter** | `claude-agent-acp` / `codex-acp` (must be on PATH, or configured) |
+| **Key Required** | No (the CLI uses its own login, or the gateway variables below) |
+
+LibreFang spawns an ACP adapter, which drives the real CLI as a long-lived agent, and talks to it over ACP on stdio: `initialize`, then `session/new` (working directory plus the LibreFang MCP bridge when the agent has tools), then `session/prompt`. `session/update` chunks stream back as text, thinking and tool-phase events; tool calls run inside the agent and are never handed to the LibreFang tool loop. No print or one-shot CLI mode is used.
+
+**Setup:**
+1. Install the CLI you want and log in (`claude`, or `codex`).
+2. Install the adapter:
+   - Claude Code: `npm install -g @agentclientprotocol/claude-agent-acp` (formerly `@zed-industries/claude-code-acp`; its `claude-code-acp` binary also works if you point the path at it).
+   - Codex: `npm install -g @agentclientprotocol/codex-acp`.
+3. Set `[default_model] provider = "claude-code-acp"` (or `"codex-acp"`), and set `LIBREFANG_ACP_CWD` to the directory the agent should work in.
+
+These providers are not yet in the model catalog (the provider TOMLs live in `librefang/librefang-registry`), so configure them by provider id.
+
+**Configuration:**
+
+| Setting | Effect |
+|---|---|
+| `base_url` (or `[provider_urls] claude-code-acp = "/path/to/adapter"`) | Adapter executable. Wins over the env var below; also used by the availability probe. |
+| `LIBREFANG_CLAUDE_ACP_PATH` / `LIBREFANG_CODEX_ACP_PATH` | Adapter executable when no config value is set. Default `claude-agent-acp` / `codex-acp` on PATH. |
+| `LIBREFANG_CLAUDE_ACP_ARGS` / `LIBREFANG_CODEX_ACP_ARGS` | Extra adapter arguments, whitespace-separated (no shell). |
+| `LIBREFANG_ACP_CWD` | Working directory for the adapter process and `session/new`. It must exist. **Unset: a fresh, empty scratch directory per turn, removed afterwards** (never the daemon's directory). |
+| `LIBREFANG_ACP_PERMISSION_POLICY` | How `session/request_permission` is answered: `deny-all` (**default**), `allow-all`, or `allow:<kind>,<kind>` using ACP tool kinds (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`). Every decision is logged at `info`. |
+| `LIBREFANG_ACP_SESSION_MODE` | ACP session mode enforced right after `session/new` with `session/set_mode`. Default `default` for Claude; none for Codex. Empty keeps the agent's own mode. If the agent offers modes but not this one, the turn fails. |
+| `LIBREFANG_ACP_GATEWAY_AUTH` | `passthrough` or `authenticate` (Claude). Default `passthrough` when a subscription token is present, else `authenticate`. See *Model gateway* below. |
+| `LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE` | File holding a Claude subscription OAuth token, read at spawn into `CLAUDE_CODE_OAUTH_TOKEN` when that is unset. |
+
+**What the permission policy does and does not cover.** The policy answers only the permission requests the adapter actually sends. Claude Code decides some tool calls itself before asking: its permission mode and the allow rules in your Claude settings apply first. The driver therefore also:
+- sends `_meta.claudeCode.options.allowDangerouslySkipPermissions = false` in `session/new`, which turns bypass off for the session in `claude-agent-acp` (0.84.0 `dist/acp-agent.js:6486-6488`; a `bypassPermissions` default then falls back to `default`);
+- switches the session to the `default` mode (`session/set_mode`), so a `defaultMode` such as `acceptEdits` or `dontAsk` in your Claude settings does not apply;
+- keeps any variable containing `DANGEROUSLY`, `SKIP_PERMISSIONS` or `BYPASS_PERMISSIONS`, and `IS_SANDBOX`, out of the adapter's environment, and never passes a skip-permissions flag;
+- runs in a scratch directory by default, so no project's `.claude/settings.json` allow rules are picked up.
+
+Allow rules in your **user** Claude settings (`~/.claude/settings.json` `permissions.allow`) still apply and are never seen by the policy. With `allow:<kind>`, the kind is the one the agent reports; a mislabelled call is judged by its label. For Codex, no session mode is enforced and `codex-acp`'s own approval behaviour has not been verified, so treat `deny-all` as covering only what it asks about.
+
+**Environment.** The adapter starts from an empty environment plus an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `XDG_*_HOME` / `XDG_RUNTIME_DIR`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `HTTP(S)_PROXY` / `NO_PROXY` / `ALL_PROXY` variables, the Windows process basics, and the adapter's own prefixes: `CLAUDE_*` and `ANTHROPIC_*` for Claude (including `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_EXECUTABLE`), `OPENAI_*` and `CODEX_*` for Codex (including `OPENAI_BASE_URL`). Everything else is dropped, for example `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, other providers' keys and any unlisted `*_API_KEY`. Variables under the allowed prefixes pass even when they hold secrets, because that is how the CLI authenticates to a gateway. When a Claude subscription login exists, `ANTHROPIC_API_KEY` is also dropped so the login wins (same rule as the `claude-code` driver).
+
+**Model gateway (Claude).** Set `ANTHROPIC_BASE_URL` (and usually `ANTHROPIC_CUSTOM_HEADERS`), then pick how credentials reach the gateway with `LIBREFANG_ACP_GATEWAY_AUTH`:
+
+| Mode | Use it for | What happens |
+|------|------------|--------------|
+| `passthrough` | A **subscription passthrough** gateway, such as LiteLLM's `/anthropic` route forwarding Claude Code subscription traffic, which needs the caller's own OAuth token as `Authorization: Bearer`. | The driver never advertises or calls ACP `authenticate`. The CLI reads `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS` and `CLAUDE_CODE_OAUTH_TOKEN` from its environment and sends the token itself. **Default when a subscription token is present.** |
+| `authenticate` | A **key-based** gateway, where the key travels in a header (`ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`). | The driver advertises `clientCapabilities.auth._meta.gateway` and, if the adapter offers the `gateway` method, calls `authenticate` with the base URL and headers before `session/new`. The adapter then gives the CLI a placeholder `ANTHROPIC_AUTH_TOKEN` and blanks any OAuth token, so this mode **cannot** carry a subscription token. **Default when no subscription token is present.** |
+
+In `authenticate` mode, headers come from `ANTHROPIC_CUSTOM_HEADERS` (newline-separated `Name: Value`). `ANTHROPIC_AUTH_TOKEN` becomes `Authorization: Bearer …` and `ANTHROPIC_API_KEY` becomes `x-api-key`, unless a custom header already sets them. `ANTHROPIC_API_KEY` is forwarded even when a Claude subscription login exists. If the adapter does not offer the method, the driver logs a warning and falls back to the environment.
+
+**Subscription token from a file.** `LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE` names a file, for example a mounted secret like `/run/secrets/claude/oauth_token`. When `CLAUDE_CODE_OAUTH_TOKEN` is not already set, the driver reads the file at each spawn and sets it as the adapter's `CLAUDE_CODE_OAUTH_TOKEN`. A missing or empty file fails the turn, and the error names only the path. Logs show the gateway URL, header names and the chosen mode, never a token or header value. The file must resolve, through symlinks, to a regular file of at most 16 KiB. It is opened non-blocking and the read times out after 2 seconds.
+
+**Passthrough and the token.** In `passthrough`, the real subscription token is sent to whatever host `ANTHROPIC_BASE_URL` names, so point it only at a gateway you trust with that token. With a token present the driver also:
+- removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the adapter's environment, because Claude Code would use a leftover `ANTHROPIC_AUTH_TOKEN` instead of the OAuth token;
+- sets `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` unless you set it yourself. Claude Code then removes its credential variables, the OAuth token included, from the commands its tools run, and forces the `default` permission mode. If `LIBREFANG_ACP_SESSION_MODE` names another mode, the driver logs a warning, because that mode may not hold while the scrub is on. With `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0`, an agent allowed to run shell commands (`allow-all` or `allow:execute`) can read the token from its environment.
+
+The scrub only covers tool subprocesses. The token stays in the CLI process's own environment, so on Linux an agent allowed to read files (`allow-all`, or `allow:read` with no path limits) may be able to read it from `/proc/<pid>/environ` of the CLI or adapter process. Keep permissive policies off for agents that should not see the token.
+
+A user-level Claude `settings.json` in the adapter's `HOME` can still override `ANTHROPIC_BASE_URL` in this mode, because the adapter only pins the route when it owns the provider.
+
+**Logging.** The `agent-client-protocol` crate logs whole JSON-RPC messages at `debug` and `trace`, and those messages carry the gateway headers and the MCP bridge key. For the duration of each ACP turn the driver caps that crate's tracing targets (`agent_client_protocol*`) at `info`, whatever `RUST_LOG` says. LibreFang's own log lines stay at the configured level.
+
+**Notes:** The MCP bridge headers (`X-API-Key`, agent identity) are passed to the agent in `session/new`, as the `claude-code` driver passes them in `--mcp-config`; the agent can read them. The adapter runs in its own process group. If the caller stops reading the stream, the driver sends `session/cancel` and waits 5 s; after that, and on timeout (no `session/cancel` is sent then), the whole group is killed with SIGKILL. A `claude-code-acp/<model>` model id sets `ANTHROPIC_MODEL` for the Claude adapter; bare `claude-code-acp` leaves model choice to the CLI.

@@ -4,6 +4,7 @@
 //! Supports: Anthropic, Gemini, OpenAI, Groq, OpenRouter, DeepSeek, DeepInfra,
 //! Together, Mistral, Fireworks, Ollama, vLLM, Alibaba Coding Plan, and any
 //! OpenAI-compatible endpoint.
+pub mod acp_client;
 pub mod anthropic;
 pub(crate) mod anthropic_models;
 pub mod bedrock;
@@ -139,6 +140,10 @@ pub enum ApiFormat {
     GeminiCli,
     /// Codex CLI subprocess.
     CodexCli,
+    /// Claude Code driven as an ACP agent through `claude-agent-acp`.
+    ClaudeCodeAcp,
+    /// Codex driven as an ACP agent through `codex-acp`.
+    CodexAcp,
     /// CodeWhale CLI subprocess.
     CodeWhale,
     /// ChatGPT with session token authentication.
@@ -468,6 +473,26 @@ static PROVIDER_REGISTRY: &[ProviderEntry] = &[
         api_key_env: "",
         key_required: false,
         api_format: ApiFormat::CodexCli,
+        alt_api_key_env: None,
+        hidden: false,
+    },
+    ProviderEntry {
+        name: "claude-code-acp",
+        aliases: &["claude_code_acp"],
+        base_url: "",
+        api_key_env: "",
+        key_required: false,
+        api_format: ApiFormat::ClaudeCodeAcp,
+        alt_api_key_env: None,
+        hidden: false,
+    },
+    ProviderEntry {
+        name: "codex-acp",
+        aliases: &["codex_acp"],
+        base_url: "",
+        api_key_env: "",
+        key_required: false,
+        api_format: ApiFormat::CodexAcp,
         alt_api_key_env: None,
         hidden: false,
     },
@@ -808,6 +833,20 @@ fn create_driver_from_entry(
                 .with_message_timeout(config.message_timeout_secs)
                 .with_emit_caller_trace_headers(config.emit_caller_trace_headers),
         )),
+        ApiFormat::ClaudeCodeAcp | ApiFormat::CodexAcp => {
+            let kind = if entry.api_format == ApiFormat::ClaudeCodeAcp {
+                acp_client::AcpAgentKind::ClaudeCode
+            } else {
+                acp_client::AcpAgentKind::Codex
+            };
+            let mut d = acp_client::AcpClientDriver::new(kind, config.base_url.clone())
+                .with_message_timeout(config.message_timeout_secs)
+                .with_emit_caller_trace_headers(config.emit_caller_trace_headers);
+            if let Some(bridge) = config.mcp_bridge.clone() {
+                d = d.with_mcp_bridge(bridge);
+            }
+            Ok(Arc::new(d))
+        }
         ApiFormat::CodeWhale => Ok(Arc::new(
             codewhale::CodeWhaleDriver::new(config.base_url.clone(), config.skip_permissions)
                 .with_message_timeout(config.message_timeout_secs)
@@ -1086,6 +1125,8 @@ pub fn is_coding_agent_provider(name: &str) -> bool {
                 | ApiFormat::GeminiCli
                 | ApiFormat::CodexCli
                 | ApiFormat::CodeWhale
+                | ApiFormat::ClaudeCodeAcp
+                | ApiFormat::CodexAcp
         )
     )
 }
@@ -1126,6 +1167,10 @@ pub fn cli_provider_available(name: &str) -> bool {
         "gemini-cli" => gemini_cli::gemini_cli_available(),
         "codex-cli" => codex_cli::codex_cli_available(),
         "codewhale" => codewhale::codewhale_available(),
+        "claude-code-acp" => {
+            acp_client::acp_adapter_available(acp_client::AcpAgentKind::ClaudeCode, None)
+        }
+        "codex-acp" => acp_client::acp_adapter_available(acp_client::AcpAgentKind::Codex, None),
         _ => false,
     }
 }
@@ -1158,7 +1203,13 @@ pub fn is_proxied_via_env(env_vars: &[&str], official_hosts: &[&str]) -> bool {
 pub fn is_cli_provider(name: &str) -> bool {
     matches!(
         name,
-        "claude-code" | "qwen-code" | "gemini-cli" | "codex-cli" | "codewhale"
+        "claude-code"
+            | "qwen-code"
+            | "gemini-cli"
+            | "codex-cli"
+            | "codewhale"
+            | "claude-code-acp"
+            | "codex-acp"
     )
 }
 
@@ -1407,7 +1458,24 @@ mod tests {
         assert!(providers.contains(&"novita"));
         assert!(providers.contains(&"bedrock"));
         assert!(providers.contains(&"microsoft"));
-        assert_eq!(providers.len(), 44);
+        assert!(providers.contains(&"claude-code-acp"));
+        assert!(providers.contains(&"codex-acp"));
+        assert_eq!(providers.len(), 46);
+    }
+
+    #[test]
+    fn cli_provider_predicates_agree_for_every_registered_provider() {
+        // `is_cli_provider` gates the catalog's keyless auth-status path; it must cover
+        // every subprocess (coding-agent) provider in the registry, including the ACP ones.
+        for p in super::known_providers() {
+            assert_eq!(
+                super::is_cli_provider(p),
+                super::is_coding_agent_provider(p),
+                "is_cli_provider and is_coding_agent_provider disagree for {p}"
+            );
+        }
+        assert!(super::is_cli_provider("claude-code-acp"));
+        assert!(super::is_cli_provider("codex-acp"));
     }
 
     #[test]
@@ -1418,6 +1486,10 @@ mod tests {
             "gemini-cli",
             "qwen-code",
             "codewhale",
+            "claude-code-acp",
+            "codex-acp",
+            "claude_code_acp",
+            "codex_acp",
         ] {
             assert!(
                 super::is_coding_agent_provider(p),
