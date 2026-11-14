@@ -715,3 +715,35 @@ async fn passthrough_respects_explicit_scrub_opt_out() {
     assert!(text.contains("|scrub:0"), "{text}");
     assert!(text.contains("|oauth_match:yes"), "{text}");
 }
+
+/// F16: with the scrub on, Claude Code forces `default`, so a non-default session
+/// mode gets a warning in the log.
+#[tokio::test]
+#[serial]
+async fn scrub_with_non_default_session_mode_warns() {
+    clear_oauth_env();
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_file = token_dir.path().join("expected");
+    std::fs::write(&token_file, OAUTH_FAKE).unwrap();
+    std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", OAUTH_FAKE);
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = passthrough_driver(&token_file)
+        .with_session_mode(Some("acceptEdits".to_string()))
+        .complete(request("hello mode"))
+        .await;
+    drop(guard);
+    clear_oauth_env();
+    result.expect("turn completes");
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is on"),
+        "warning logged"
+    );
+    assert!(!log.contains(OAUTH_FAKE), "token never logged");
+}

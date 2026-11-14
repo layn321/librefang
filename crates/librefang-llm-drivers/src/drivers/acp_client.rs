@@ -612,6 +612,19 @@ const OAUTH_TOKEN_FILE_MAX: u64 = 16 * 1024;
 /// must be a regular file of at most [`OAUTH_TOKEN_FILE_MAX`] bytes, so a FIFO,
 /// device or endless file cannot block or exhaust the daemon. Reads are async.
 async fn read_oauth_token_file(path: &str) -> Result<String, LlmError> {
+    match tokio::time::timeout(OAUTH_TOKEN_READ_TIMEOUT, read_oauth_token_file_inner(path)).await {
+        Ok(result) => result,
+        Err(_) => Err(LlmError::Http(format!(
+            "{OAUTH_TOKEN_FILE_ENV} file '{path}': read timed out after {}s",
+            OAUTH_TOKEN_READ_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Upper bound on reading the token file (a hung network mount, a swapped FIFO).
+const OAUTH_TOKEN_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn read_oauth_token_file_inner(path: &str) -> Result<String, LlmError> {
     use tokio::io::AsyncReadExt;
     let fail = |why: String| LlmError::Http(format!("{OAUTH_TOKEN_FILE_ENV} file '{path}': {why}"));
     // Checked before open: opening a FIFO for reading blocks until a writer appears.
@@ -624,7 +637,14 @@ async fn read_oauth_token_file(path: &str) -> Result<String, LlmError> {
     if meta.len() > OAUTH_TOKEN_FILE_MAX {
         return Err(fail(format!("larger than {OAUTH_TOKEN_FILE_MAX} bytes")));
     }
-    let file = tokio::fs::File::open(path)
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    // Non-blocking open: if the path became a FIFO after the stat, open returns
+    // at once instead of waiting for a writer; the re-check below then refuses it.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options
+        .open(path)
         .await
         .map_err(|e| fail(format!("cannot read ({e})")))?;
     // Re-check the opened file, in case the path was swapped after the stat.
@@ -662,12 +682,28 @@ async fn read_oauth_token_file(path: &str) -> Result<String, LlmError> {
 ///   `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is on (off by default outside GitHub
 ///   Actions). It is turned on here unless the operator set it. When on, Claude
 ///   Code also forces the `default` permission mode.
-fn harden_passthrough_env(cmd: &mut tokio::process::Command) {
+///
+/// Returns whether scrubbing ends up on.
+fn harden_passthrough_env(cmd: &mut tokio::process::Command) -> bool {
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
-    if std::env::var_os(SUBPROCESS_ENV_SCRUB_VAR).is_none() {
-        cmd.env(SUBPROCESS_ENV_SCRUB_VAR, "1");
+    match std::env::var(SUBPROCESS_ENV_SCRUB_VAR) {
+        // Claude Code's own truthy set (`1`, `true`, `yes`, `on`).
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => {
+            cmd.env(SUBPROCESS_ENV_SCRUB_VAR, "1");
+            true
+        }
     }
+}
+
+/// Whether a configured session mode will be overridden by the subprocess scrub,
+/// which makes Claude Code force its `default` permission mode.
+fn scrub_overrides_session_mode(scrub_on: bool, session_mode: Option<&str>) -> bool {
+    scrub_on && session_mode.is_some_and(|m| !m.is_empty() && m != "default")
 }
 
 /// Claude Code's switch for scrubbing credentials from tool subprocesses.
@@ -1266,7 +1302,16 @@ impl LlmDriver for AcpClientDriver {
                     ),
                     GatewayAuthMode::Passthrough => {
                         if oauth_token_present {
-                            harden_passthrough_env(&mut cmd);
+                            let scrub_on = harden_passthrough_env(&mut cmd);
+                            if scrub_overrides_session_mode(scrub_on, self.session_mode.as_deref())
+                            {
+                                warn!(
+                                    agent = label,
+                                    session_mode = self.session_mode.as_deref().unwrap_or(""),
+                                    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is on, so Claude Code forces its \
+                                     `default` permission mode; the configured ACP session mode may not hold"
+                                );
+                            }
                         }
                         None
                     }
@@ -1927,5 +1972,14 @@ mod tests {
     fn invalid_gateway_auth_mode_is_not_echoed() {
         let err = GatewayAuthMode::resolve(Some("sk-pasted-by-mistake"), false).unwrap_err();
         assert!(!err.contains("sk-pasted"), "{err}");
+    }
+
+    #[test]
+    fn scrub_conflict_only_for_non_default_modes() {
+        assert!(scrub_overrides_session_mode(true, Some("acceptEdits")));
+        assert!(!scrub_overrides_session_mode(true, Some("default")));
+        assert!(!scrub_overrides_session_mode(true, Some("")));
+        assert!(!scrub_overrides_session_mode(true, None));
+        assert!(!scrub_overrides_session_mode(false, Some("acceptEdits")));
     }
 }
