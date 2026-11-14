@@ -286,7 +286,13 @@ Allow rules in your **user** Claude settings (`~/.claude/settings.json` `permiss
 
 In `authenticate` mode, headers come from `ANTHROPIC_CUSTOM_HEADERS` (newline-separated `Name: Value`). `ANTHROPIC_AUTH_TOKEN` becomes `Authorization: Bearer …` and `ANTHROPIC_API_KEY` becomes `x-api-key`, unless a custom header already sets them. `ANTHROPIC_API_KEY` is forwarded even when a Claude subscription login exists. If the adapter does not offer the method, the driver logs a warning and falls back to the environment.
 
-**Subscription token from a file.** `LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE` names a file, for example a mounted secret like `/run/secrets/claude/oauth_token`. When `CLAUDE_CODE_OAUTH_TOKEN` is not already set, the driver reads the file at each spawn and sets it as the adapter's `CLAUDE_CODE_OAUTH_TOKEN`. A missing or empty file fails the turn, and the error names only the path. Logs show the gateway URL, header names and the chosen mode, never a token or header value.
+**Subscription token from a file.** `LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE` names a file, for example a mounted secret like `/run/secrets/claude/oauth_token`. When `CLAUDE_CODE_OAUTH_TOKEN` is not already set, the driver reads the file at each spawn and sets it as the adapter's `CLAUDE_CODE_OAUTH_TOKEN`. A missing or empty file fails the turn, and the error names only the path. Logs show the gateway URL, header names and the chosen mode, never a token or header value. The file must resolve, through symlinks, to a regular file of at most 16 KiB.
+
+**Passthrough and the token.** In `passthrough`, the real subscription token is sent to whatever host `ANTHROPIC_BASE_URL` names, so point it only at a gateway you trust with that token. With a token present the driver also:
+- removes `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from the adapter's environment, because Claude Code would use a leftover `ANTHROPIC_AUTH_TOKEN` instead of the OAuth token;
+- sets `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` unless you set it yourself. Claude Code then removes its credential variables, the OAuth token included, from the commands its tools run, and forces the `default` permission mode. With `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0`, an agent allowed to run shell commands (`allow-all` or `allow:execute`) can read the token from its environment.
+
+A user-level Claude `settings.json` in the adapter's `HOME` can still override `ANTHROPIC_BASE_URL` in this mode, because the adapter only pins the route when it owns the provider.
 
 **Logging.** The `agent-client-protocol` crate logs whole JSON-RPC messages at `debug` and `trace`, and those messages carry the gateway headers and the MCP bridge key. For the duration of each ACP turn the driver caps that crate's tracing targets (`agent_client_protocol*`) at `info`, whatever `RUST_LOG` says. LibreFang's own log lines stay at the configured level.
 

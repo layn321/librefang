@@ -562,6 +562,7 @@ fn clear_oauth_env() {
         "CLAUDE_CODE_OAUTH_TOKEN",
         "LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE",
         "LIBREFANG_ACP_GATEWAY_AUTH",
+        "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
     ] {
         std::env::remove_var(k);
     }
@@ -593,6 +594,9 @@ async fn passthrough_keeps_oauth_token_and_never_authenticates() {
     std::env::set_var("LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE", &token_file);
     std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
     std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
+    // F12: leftover credentials that Claude Code would prefer over the OAuth token.
+    std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-fake-competing");
+    std::env::set_var("ANTHROPIC_AUTH_TOKEN", "fake-competing-auth-token");
     let capture = Capture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
@@ -606,6 +610,8 @@ async fn passthrough_keeps_oauth_token_and_never_authenticates() {
     drop(guard);
     std::env::remove_var("ANTHROPIC_BASE_URL");
     std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+    std::env::remove_var("ANTHROPIC_API_KEY");
+    std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
     clear_oauth_env();
 
     let text = result
@@ -622,6 +628,14 @@ async fn passthrough_keeps_oauth_token_and_never_authenticates() {
     );
     assert!(text.contains(&format!("|base_url:{GW_BASE}")), "{text}");
     assert!(text.contains("|custom_headers_env:yes"), "{text}");
+    assert!(
+        text.contains("|competing_creds:none"),
+        "API key and auth token dropped so the OAuth token wins: {text}"
+    );
+    assert!(
+        text.contains("|scrub:1"),
+        "tool subprocess env scrubbing turned on: {text}"
+    );
     assert!(
         !text.contains("|gw_base:"),
         "authenticate was not sent: {text}"
@@ -678,7 +692,26 @@ async fn missing_oauth_token_file_fails_closed() {
     clear_oauth_env();
     assert!(
         err.to_string()
-            .contains("cannot read LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE"),
+            .contains("LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE file '/nonexistent/librefang-oauth-token': cannot read"),
         "{err}"
     );
+}
+
+/// An operator's explicit `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0` is respected.
+#[tokio::test]
+#[serial]
+async fn passthrough_respects_explicit_scrub_opt_out() {
+    clear_oauth_env();
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_file = token_dir.path().join("expected");
+    std::fs::write(&token_file, OAUTH_FAKE).unwrap();
+    std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", OAUTH_FAKE);
+    std::env::set_var("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "0");
+    let result = passthrough_driver(&token_file)
+        .complete(request("hello opt-out"))
+        .await;
+    clear_oauth_env();
+    let text = result.expect("turn completes").text();
+    assert!(text.contains("|scrub:0"), "{text}");
+    assert!(text.contains("|oauth_match:yes"), "{text}");
 }

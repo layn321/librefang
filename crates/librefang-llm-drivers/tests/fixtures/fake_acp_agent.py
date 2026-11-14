@@ -127,6 +127,9 @@ def handle_prompt(rid, params, state):
         chunk(sid, "|oauth_match:" + ("yes" if expected and got == expected else "no"))
         chunk(sid, "|placeholder:" + ("yes" if os.environ.get("ANTHROPIC_AUTH_TOKEN") == "acp-proxy" else "no"))
         chunk(sid, "|custom_headers_env:" + ("yes" if env_custom_headers() else "no"))
+        competing = [k for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") if k in os.environ]
+        chunk(sid, "|competing_creds:" + (",".join(competing) or "none"))
+        chunk(sid, "|scrub:" + os.environ.get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB", "<unset>"))
     send({
         "jsonrpc": "2.0",
         "method": "session/update",

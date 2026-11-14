@@ -595,28 +595,83 @@ impl GatewayAuthMode {
             None => Ok(Self::Authenticate),
             Some("authenticate") => Ok(Self::Authenticate),
             Some("passthrough") => Ok(Self::Passthrough),
-            Some(other) => Err(format!(
-                "{GATEWAY_AUTH_ENV} must be `authenticate` or `passthrough`, got `{other}`"
+            // The value is not echoed: someone may have pasted a secret into it.
+            Some(_) => Err(format!(
+                "{GATEWAY_AUTH_ENV} must be `authenticate` or `passthrough`"
             )),
         }
     }
 }
 
+/// Largest token file accepted; real OAuth tokens are about 100 bytes.
+const OAUTH_TOKEN_FILE_MAX: u64 = 16 * 1024;
+
 /// Read a subscription token file. Errors name the path, never the content.
-fn read_oauth_token_file(path: &str) -> Result<String, LlmError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        LlmError::Http(format!(
-            "cannot read {OAUTH_TOKEN_FILE_ENV} file '{path}': {e}"
-        ))
-    })?;
+///
+/// Symlinks are followed (Kubernetes secret mounts are symlinks), but the target
+/// must be a regular file of at most [`OAUTH_TOKEN_FILE_MAX`] bytes, so a FIFO,
+/// device or endless file cannot block or exhaust the daemon. Reads are async.
+async fn read_oauth_token_file(path: &str) -> Result<String, LlmError> {
+    use tokio::io::AsyncReadExt;
+    let fail = |why: String| LlmError::Http(format!("{OAUTH_TOKEN_FILE_ENV} file '{path}': {why}"));
+    // Checked before open: opening a FIFO for reading blocks until a writer appears.
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| fail(format!("cannot read ({e})")))?;
+    if !meta.is_file() {
+        return Err(fail("not a regular file".to_string()));
+    }
+    if meta.len() > OAUTH_TOKEN_FILE_MAX {
+        return Err(fail(format!("larger than {OAUTH_TOKEN_FILE_MAX} bytes")));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| fail(format!("cannot read ({e})")))?;
+    // Re-check the opened file, in case the path was swapped after the stat.
+    let opened = file
+        .metadata()
+        .await
+        .map_err(|e| fail(format!("cannot read ({e})")))?;
+    if !opened.is_file() {
+        return Err(fail("not a regular file".to_string()));
+    }
+    let mut raw = Vec::new();
+    file.take(OAUTH_TOKEN_FILE_MAX + 1)
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| fail(format!("cannot read ({e})")))?;
+    if raw.len() as u64 > OAUTH_TOKEN_FILE_MAX {
+        return Err(fail(format!("larger than {OAUTH_TOKEN_FILE_MAX} bytes")));
+    }
+    let raw = String::from_utf8(raw).map_err(|_| fail("not valid UTF-8".to_string()))?;
     let token = raw.trim();
     if token.is_empty() {
-        return Err(LlmError::Http(format!(
-            "{OAUTH_TOKEN_FILE_ENV} file '{path}' is empty"
-        )));
+        return Err(fail("is empty".to_string()));
     }
     Ok(token.to_string())
 }
+
+/// Subscription passthrough with a token: make the token the CLI's only credential
+/// and keep it out of the agent's tool subprocesses.
+///
+/// - Claude Code picks `ANTHROPIC_AUTH_TOKEN` before `CLAUDE_CODE_OAUTH_TOKEN` when it
+///   resolves its auth source, so a leftover one would replace the subscription token;
+///   `ANTHROPIC_API_KEY` goes through a separate key path. Both are removed.
+/// - Claude Code deletes `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+///   `ANTHROPIC_AUTH_TOKEN` and similar from tool subprocess env only when
+///   `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is on (off by default outside GitHub
+///   Actions). It is turned on here unless the operator set it. When on, Claude
+///   Code also forces the `default` permission mode.
+fn harden_passthrough_env(cmd: &mut tokio::process::Command) {
+    cmd.env_remove("ANTHROPIC_API_KEY");
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    if std::env::var_os(SUBPROCESS_ENV_SCRUB_VAR).is_none() {
+        cmd.env(SUBPROCESS_ENV_SCRUB_VAR, "1");
+    }
+}
+
+/// Claude Code's switch for scrubbing credentials from tool subprocesses.
+const SUBPROCESS_ENV_SCRUB_VAR: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 
 /// Client capabilities for `initialize`. A gateway turns on
 /// `auth._meta.gateway` so the Claude adapter offers its gateway auth method.
@@ -1187,7 +1242,7 @@ impl LlmDriver for AcpClientDriver {
                 .filter(|p| !p.is_empty())
             {
                 // Value goes straight onto the child env; it is never logged.
-                cmd.env(OAUTH_TOKEN_VAR, read_oauth_token_file(&path)?);
+                cmd.env(OAUTH_TOKEN_VAR, read_oauth_token_file(&path).await?);
                 oauth_token_present = true;
             }
         }
@@ -1209,7 +1264,12 @@ impl LlmDriver for AcpClientDriver {
                         self.kind,
                         allowed_adapter_env(self.kind, std::env::vars()),
                     ),
-                    GatewayAuthMode::Passthrough => None,
+                    GatewayAuthMode::Passthrough => {
+                        if oauth_token_present {
+                            harden_passthrough_env(&mut cmd);
+                        }
+                        None
+                    }
                 }
             }
             AcpAgentKind::Codex => None,
@@ -1810,21 +1870,62 @@ mod tests {
         assert!(GatewayAuthMode::resolve(Some("bogus"), false).is_err());
     }
 
-    #[test]
-    fn oauth_token_file_errors_never_carry_content() {
+    #[tokio::test]
+    async fn oauth_token_file_is_capped_regular_and_never_echoed() {
         let dir = tempfile::tempdir().unwrap();
-        let empty = dir.path().join("empty");
-        std::fs::write(&empty, "  \n").unwrap();
-        let err = read_oauth_token_file(empty.to_str().unwrap()).unwrap_err();
+        let p = |n: &str| dir.path().join(n).to_string_lossy().into_owned();
+        std::fs::write(p("empty"), "  \n").unwrap();
+        let err = read_oauth_token_file(&p("empty")).await.unwrap_err();
         assert!(err.to_string().contains("is empty"), "{err}");
-        let full = dir.path().join("tok");
-        std::fs::write(&full, "tok-fake-123\n").unwrap();
+
+        std::fs::write(p("tok"), "tok-fake-123\n").unwrap();
         assert_eq!(
-            read_oauth_token_file(full.to_str().unwrap()).unwrap(),
+            read_oauth_token_file(&p("tok")).await.unwrap(),
             "tok-fake-123"
         );
-        let missing = dir.path().join("missing");
-        let err = read_oauth_token_file(missing.to_str().unwrap()).unwrap_err();
+
+        let err = read_oauth_token_file(&p("missing")).await.unwrap_err();
         assert!(err.to_string().contains("cannot read"), "{err}");
+
+        let big = "x".repeat(OAUTH_TOKEN_FILE_MAX as usize + 1);
+        std::fs::write(p("big"), &big).unwrap();
+        let err = read_oauth_token_file(&p("big")).await.unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        assert!(!err.to_string().contains("xxxx"), "content echoed: {err}");
+
+        std::fs::create_dir(p("dir")).unwrap();
+        let err = read_oauth_token_file(&p("dir")).await.unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+
+        #[cfg(unix)]
+        {
+            // Symlinked secret mounts are accepted; a symlink to a FIFO is not,
+            // and must be refused without blocking on open.
+            std::os::unix::fs::symlink(p("tok"), p("link")).unwrap();
+            assert_eq!(
+                read_oauth_token_file(&p("link")).await.unwrap(),
+                "tok-fake-123"
+            );
+            let status = std::process::Command::new("mkfifo")
+                .arg(p("fifo"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::os::unix::fs::symlink(p("fifo"), p("fifolink")).unwrap();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_oauth_token_file(&p("fifolink")),
+            )
+            .await
+            .expect("FIFO refused without blocking")
+            .unwrap_err();
+            assert!(err.to_string().contains("not a regular file"), "{err}");
+        }
+    }
+
+    #[test]
+    fn invalid_gateway_auth_mode_is_not_echoed() {
+        let err = GatewayAuthMode::resolve(Some("sk-pasted-by-mistake"), false).unwrap_err();
+        assert!(!err.contains("sk-pasted"), "{err}");
     }
 }
