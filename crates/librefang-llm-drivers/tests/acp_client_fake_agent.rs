@@ -14,6 +14,16 @@ use serial_test::serial;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Secrets that must never reach an adapter: one on the old exact list, an unlisted
+/// `*_API_KEY`, an AWS secret, a `*_TOKEN`, and the variable that re-enables bypass.
+const SECRET_VARS: &[&str] = &[
+    "GROQ_API_KEY",
+    "FAKE_UNLISTED_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "GITHUB_TOKEN",
+    "IS_SANDBOX",
+];
+
 fn fixture() -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/fake_acp_agent.py")
@@ -71,7 +81,9 @@ fn text_of(events: &[StreamEvent]) -> String {
 #[serial]
 async fn full_turn_streams_and_allows_permission_per_policy() {
     std::env::set_var("ANTHROPIC_BASE_URL", "http://agentgateway.test:8080");
-    std::env::set_var("GROQ_API_KEY", "must-not-leak");
+    for k in SECRET_VARS {
+        std::env::set_var(k, "must-not-leak");
+    }
     let d = driver("normal", PermissionPolicy::AllowAll).with_mcp_bridge(McpBridgeConfig {
         base_url: "http://127.0.0.1:4545".to_string(),
         api_key: None,
@@ -85,7 +97,9 @@ async fn full_turn_streams_and_allows_permission_per_policy() {
 
     let (events, response) = run_stream(&d, req).await;
     std::env::remove_var("ANTHROPIC_BASE_URL");
-    std::env::remove_var("GROQ_API_KEY");
+    for k in SECRET_VARS {
+        std::env::remove_var(k);
+    }
 
     let text = text_of(&events);
     assert!(
@@ -102,7 +116,19 @@ async fn full_turn_streams_and_allows_permission_per_policy() {
     );
     assert!(
         text.contains("|leaked:<none>"),
-        "env filter stripped GROQ_API_KEY: {text}"
+        "allowlist stripped listed, unlisted and AWS secrets: {text}"
+    );
+    assert!(
+        text.contains("|mode:default"),
+        "driver switched the session to `default` mode: {text}"
+    );
+    assert!(
+        text.contains("|bypass_allowed:false"),
+        "session/new _meta disabled bypass: {text}"
+    );
+    assert!(
+        text.contains("|cwd_match:yes"),
+        "adapter runs in the session cwd: {text}"
     );
     assert!(
         text.contains("|permission:granted"),
@@ -210,4 +236,152 @@ async fn missing_adapter_reports_install_hint() {
         .await
         .expect_err("spawn must fail");
     assert!(err.to_string().contains("claude-agent-acp"), "{err}");
+}
+
+/// The Codex adapter gets OPENAI_* but not ANTHROPIC_*, and no unlisted secret.
+#[tokio::test]
+#[serial]
+async fn codex_env_allowlist_passes_openai_only() {
+    std::env::set_var("OPENAI_BASE_URL", "http://agentgateway.test:8080/v1");
+    std::env::set_var("ANTHROPIC_BASE_URL", "http://agentgateway.test:8080");
+    for k in SECRET_VARS {
+        std::env::set_var(k, "must-not-leak");
+    }
+    let d = AcpClientDriver::new(AcpAgentKind::Codex, Some("python3".to_string()))
+        .with_args(vec![fixture(), "normal".to_string()])
+        .with_permission_policy(PermissionPolicy::AllowAll)
+        .with_message_timeout(30);
+    let (events, _) = run_stream(&d, request("hi")).await;
+    std::env::remove_var("OPENAI_BASE_URL");
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    for k in SECRET_VARS {
+        std::env::remove_var(k);
+    }
+    let text = text_of(&events);
+    assert!(
+        text.contains("|openai_base:http://agentgateway.test:8080/v1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("|base_url:<unset>"),
+        "ANTHROPIC_* withheld from codex: {text}"
+    );
+    assert!(text.contains("|leaked:<none>"), "{text}");
+    // No mode is enforced for Codex (its mode ids are unverified); the agent's stays.
+    assert!(text.contains("|mode:acceptEdits"), "{text}");
+}
+
+/// A configured cwd is used as-is; the default is a scratch dir removed after the turn.
+#[tokio::test]
+#[serial]
+async fn session_cwd_is_explicit_and_scratch_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = driver("normal", PermissionPolicy::AllowAll).with_cwd(dir.path().to_path_buf());
+    let (events, _) = run_stream(&d, request("hi")).await;
+    assert!(text_of(&events).contains("|cwd_match:yes"));
+    assert!(dir.path().exists(), "a configured cwd is never removed");
+
+    let before = scratch_dirs();
+    let d = driver("normal", PermissionPolicy::AllowAll);
+    let (events, _) = run_stream(&d, request("hi")).await;
+    assert!(text_of(&events).contains("|cwd_match:yes"));
+    assert_eq!(scratch_dirs(), before, "per-turn scratch cwd removed");
+
+    let missing = dir.path().join("absent");
+    let d = driver("normal", PermissionPolicy::AllowAll).with_cwd(missing);
+    assert!(
+        d.complete(request("hi")).await.is_err(),
+        "missing cwd is an error"
+    );
+}
+
+fn scratch_dirs() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("librefang-acp-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// A required mode the agent does not offer fails the turn (fail closed).
+#[tokio::test]
+#[serial]
+async fn missing_required_mode_fails_closed() {
+    let d = driver("no_default_mode", PermissionPolicy::AllowAll);
+    let err = d
+        .complete(request("hi"))
+        .await
+        .expect_err("must not run in bypass mode");
+    assert!(err.to_string().contains("session mode"), "{err}");
+}
+
+/// An agent that ignores session/cancel: the driver gives up after the grace period,
+/// returns an error and kills the adapter.
+#[tokio::test]
+#[serial]
+async fn agent_ignoring_cancel_is_killed_after_grace() {
+    let d = driver("ignore_cancel", PermissionPolicy::AllowAll)
+        .with_cancel_grace(std::time::Duration::from_millis(300));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let reader = tokio::spawn(async move {
+        let first = rx.recv().await;
+        drop(rx);
+        first
+    });
+    let started = std::time::Instant::now();
+    let err = d.stream(request("hi"), tx).await.expect_err("must fail");
+    assert!(reader.await.unwrap().is_some());
+    assert!(err.to_string().contains("did not acknowledge"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(d.active_pids().is_empty());
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks for existence; no signal is delivered.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The message timeout kills the adapter's whole process group, grandchildren included.
+#[tokio::test]
+#[serial]
+async fn timeout_kills_process_group_including_grandchild() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("grandchild.pid");
+    let d = AcpClientDriver::new(AcpAgentKind::ClaudeCode, Some("python3".to_string()))
+        .with_args(vec![
+            fixture(),
+            "grandchild_hang".to_string(),
+            marker.to_string_lossy().into_owned(),
+        ])
+        .with_message_timeout(2);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let err = d
+        .stream(request("hi"), tx)
+        .await
+        .expect_err("must time out");
+    let _ = drain.await;
+    assert!(
+        matches!(
+            err,
+            librefang_llm_drivers::llm_driver::LlmError::TimedOut { .. }
+        ),
+        "{err}"
+    );
+    let pid: i32 = std::fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pid_alive(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !pid_alive(pid),
+        "grandchild {pid} survived the timeout kill"
+    );
 }

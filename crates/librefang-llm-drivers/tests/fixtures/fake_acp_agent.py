@@ -9,7 +9,13 @@ argv[2] (cancel marker path, `hang` mode only):
   drop_stream  answer the prompt with end_turn but send no session/update
   hang         send one chunk, then wait for session/cancel and answer
                stopReason=cancelled (writes the marker file if given)
+  ignore_cancel     send one chunk, then never answer (ignores session/cancel)
+  grandchild_hang   start a `sleep` grandchild, write its pid to the marker file,
+                    send one chunk, then never answer
+  no_default_mode   session/new reports only `bypassPermissions` (no `default`)
 """
+
+import subprocess
 
 import json
 import os
@@ -61,6 +67,14 @@ def handle_prompt(rid, params, state):
     if MODE == "drop_stream":
         send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
         return
+    if MODE in ("ignore_cancel", "grandchild_hang"):
+        if MODE == "grandchild_hang":
+            child = subprocess.Popen(["sleep", "300"])
+            with open(CANCEL_MARKER, "w") as f:
+                f.write(str(child.pid))
+        chunk(sid, "working...")
+        while True:
+            read()
     if MODE == "hang":
         chunk(sid, "working...")
         while True:
@@ -75,7 +89,14 @@ def handle_prompt(rid, params, state):
     chunk(sid, "echo:" + prompt_text.splitlines()[-1] if prompt_text else "echo:")
     chunk(sid, "|base_url:" + os.environ.get("ANTHROPIC_BASE_URL", "<unset>"))
     chunk(sid, "|mcp:" + ",".join(state.get("mcp", [])))
-    chunk(sid, "|leaked:" + os.environ.get("GROQ_API_KEY", "<none>"))
+    watched = ["GROQ_API_KEY", "AWS_SECRET_ACCESS_KEY", "FAKE_UNLISTED_API_KEY",
+               "GITHUB_TOKEN", "IS_SANDBOX"]
+    leaked = [k for k in watched if k in os.environ]
+    chunk(sid, "|leaked:" + (",".join(leaked) or "<none>"))
+    chunk(sid, "|openai_base:" + os.environ.get("OPENAI_BASE_URL", "<unset>"))
+    chunk(sid, "|mode:" + state.get("mode", "<none>"))
+    chunk(sid, "|bypass_allowed:" + state.get("bypass", "<unset>"))
+    chunk(sid, "|cwd_match:" + ("yes" if os.getcwd() == os.path.realpath(state.get("cwd", "")) else "no"))
     send({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -122,7 +143,23 @@ def main():
             }})
         elif method == "session/new":
             state["mcp"] = [s.get("name", "") for s in params.get("mcpServers", [])]
-            send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "sess-1"}})
+            state["cwd"] = params.get("cwd", "")
+            opts = params.get("_meta", {}).get("claudeCode", {}).get("options", {})
+            if "allowDangerouslySkipPermissions" in opts:
+                state["bypass"] = str(opts["allowDangerouslySkipPermissions"]).lower()
+            if MODE == "no_default_mode":
+                modes = {"currentModeId": "bypassPermissions",
+                         "availableModes": [{"id": "bypassPermissions", "name": "Bypass"}]}
+            else:
+                modes = {"currentModeId": "acceptEdits",
+                         "availableModes": [{"id": "default", "name": "Default"},
+                                            {"id": "acceptEdits", "name": "Accept edits"}]}
+            state["mode"] = modes["currentModeId"]
+            send({"jsonrpc": "2.0", "id": rid,
+                  "result": {"sessionId": "sess-1", "modes": modes}})
+        elif method == "session/set_mode":
+            state["mode"] = params.get("modeId", "")
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/prompt":
             handle_prompt(rid, params, state)
         elif rid is not None and method is not None:

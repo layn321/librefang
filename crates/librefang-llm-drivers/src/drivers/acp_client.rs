@@ -25,11 +25,11 @@
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ClientCapabilities, ContentBlock as AcpContentBlock,
-    FileSystemCapabilities, HttpHeader, InitializeRequest, McpServer, McpServerHttp,
+    FileSystemCapabilities, HttpHeader, InitializeRequest, McpServer, McpServerHttp, Meta,
     NewSessionRequest, PermissionOption, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason as AcpStopReason,
-    TextContent, ToolKind, Usage as AcpUsage,
+    SelectedPermissionOutcome, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionModeRequest, StopReason as AcpStopReason, TextContent, ToolKind, Usage as AcpUsage,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo};
@@ -47,12 +47,60 @@ pub use crate::llm_driver::McpBridgeConfig;
 
 /// Env var selecting the permission policy (see [`PermissionPolicy::parse`]).
 pub const PERMISSION_POLICY_ENV: &str = "LIBREFANG_ACP_PERMISSION_POLICY";
-/// Env var overriding the session working directory sent in `session/new`.
+/// Env var setting the session working directory sent in `session/new`. Unset means a
+/// fresh, empty scratch directory per turn (removed afterwards), never the daemon's cwd.
 pub const CWD_ENV: &str = "LIBREFANG_ACP_CWD";
+/// Env var setting the ACP session mode the driver enforces after `session/new`.
+/// Unset uses [`AcpAgentKind::default_session_mode`]; an empty value keeps the agent's own mode.
+pub const SESSION_MODE_ENV: &str = "LIBREFANG_ACP_SESSION_MODE";
 
 /// How long to wait for the agent to acknowledge `session/cancel` before the
 /// process group is killed.
-const CANCEL_GRACE: Duration = Duration::from_secs(5);
+const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// Non-secret variables every adapter needs to start (Node, TLS, proxies, locale).
+const BASE_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TERM",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    // Windows process basics.
+    "SYSTEMROOT",
+    "SystemRoot",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PATHEXT",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+];
+
+/// Substrings that keep a variable out even when its prefix is allowed: nothing in the
+/// adapter's environment may switch a CLI into a permission-bypass mode.
+const BYPASS_ENV_MARKERS: &[&str] = &["DANGEROUSLY", "SKIP_PERMISSIONS", "BYPASS_PERMISSIONS"];
 
 /// Which adapter this driver spawns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +133,27 @@ impl AcpAgentKind {
         match self {
             Self::ClaudeCode => "LIBREFANG_CLAUDE_ACP_ARGS",
             Self::Codex => "LIBREFANG_CODEX_ACP_ARGS",
+        }
+    }
+
+    /// Provider-prefixed variables this adapter receives (credentials, base URLs, the
+    /// CLI's own settings such as `CLAUDE_CODE_EXECUTABLE`).
+    pub fn env_prefixes(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &["CLAUDE_", "ANTHROPIC_"],
+            Self::Codex => &["OPENAI_", "CODEX_"],
+        }
+    }
+
+    /// The ACP session mode enforced after `session/new` unless configured otherwise.
+    ///
+    /// Claude: `default`, the mode in which Claude Code asks before acting
+    /// (`claude-agent-acp` 0.84.0 `dist/permissions/modes.js` maps `default`/`manual` to it).
+    /// Codex: none, because `codex-acp`'s mode ids have not been verified here.
+    pub fn default_session_mode(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeCode => Some("default"),
+            Self::Codex => None,
         }
     }
 
@@ -349,6 +418,113 @@ fn bridge_mcp_server(bridge: &McpBridgeConfig, request: &CompletionRequest) -> M
     McpServer::Http(McpServerHttp::new("librefang", url).headers(headers))
 }
 
+// ── Adapter environment ──────────────────────────────────────────
+
+/// Whether `key` may be passed to the adapter for `kind`.
+pub fn adapter_env_key_allowed(kind: AcpAgentKind, key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if BYPASS_ENV_MARKERS.iter().any(|m| upper.contains(m)) {
+        return false;
+    }
+    BASE_ENV_ALLOWLIST.contains(&key)
+        || key.starts_with("LC_")
+        || kind.env_prefixes().iter().any(|p| key.starts_with(p))
+}
+
+/// The adapter environment: an allowlist, not a denylist. Only the base variables in
+/// [`BASE_ENV_ALLOWLIST`], `LC_*`, and the kind's own prefixes
+/// ([`AcpAgentKind::env_prefixes`]) pass; everything else (unlisted `*_API_KEY`,
+/// `AWS_SECRET_ACCESS_KEY`, other providers' keys, tokens) is dropped.
+pub fn allowed_adapter_env(
+    kind: AcpAgentKind,
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter(|(k, _)| adapter_env_key_allowed(kind, k))
+        .collect()
+}
+
+/// The adapter executable: configured value (provider `base_url`) first, then the
+/// `LIBREFANG_*_ACP_PATH` env var, then the default name on PATH.
+pub fn resolve_adapter_command(kind: AcpAgentKind, configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var(kind.path_env())
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| kind.default_command().to_string())
+}
+
+/// `_meta` for `session/new`. For Claude it sets
+/// `claudeCode.options.allowDangerouslySkipPermissions = false`, which `claude-agent-acp`
+/// 0.84.0 reads to turn bypass off for the session (`dist/acp-agent.js:6486-6488`); a
+/// `bypassPermissions` default mode then clamps to `default` (`dist/permissions/modes.js`
+/// `resolvePermissionMode`) and the SDK is spawned with `allowDangerouslySkipPermissions:
+/// false` (`dist/acp-agent.js:6616`).
+fn session_meta(kind: AcpAgentKind) -> Option<Meta> {
+    match kind {
+        AcpAgentKind::ClaudeCode => {
+            let value = serde_json::json!({
+                "claudeCode": { "options": { "allowDangerouslySkipPermissions": false } }
+            });
+            value.as_object().cloned()
+        }
+        AcpAgentKind::Codex => None,
+    }
+}
+
+/// What to do about the session mode after `session/new`.
+#[derive(Debug, PartialEq, Eq)]
+enum ModeAction {
+    /// Already in the required mode, or no mode is required.
+    Keep,
+    /// Switch with `session/set_mode`.
+    Set,
+    /// The agent reports no modes; nothing to enforce (logged).
+    AgentHasNoModes,
+}
+
+/// Decide how to reach `required` from the agent's reported mode state. Fails closed:
+/// a required mode the agent does not offer is an error, not a silent pass.
+fn plan_session_mode(
+    required: Option<&str>,
+    modes: Option<&SessionModeState>,
+) -> Result<ModeAction, String> {
+    let Some(required) = required else {
+        return Ok(ModeAction::Keep);
+    };
+    let Some(state) = modes else {
+        return Ok(ModeAction::AgentHasNoModes);
+    };
+    if state.current_mode_id.to_string() == required {
+        return Ok(ModeAction::Keep);
+    }
+    if state
+        .available_modes
+        .iter()
+        .any(|m| m.id.to_string() == required)
+    {
+        return Ok(ModeAction::Set);
+    }
+    Err(format!(
+        "ACP agent does not offer required session mode {required:?} (current {:?})",
+        state.current_mode_id.to_string()
+    ))
+}
+
+/// Removes the per-turn scratch working directory.
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 // ── Driver ───────────────────────────────────────────────────────
 
 /// Kills the adapter's process group when dropped (cancel, timeout, error).
@@ -370,6 +546,8 @@ struct TurnInput {
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
     prompt: String,
+    session_mode: Option<String>,
+    cancel_grace: Duration,
 }
 
 /// Outcome of one prompt turn.
@@ -386,6 +564,8 @@ pub struct AcpClientDriver {
     args: Vec<String>,
     policy: PermissionPolicy,
     cwd: Option<PathBuf>,
+    session_mode: Option<String>,
+    cancel_grace: Duration,
     message_timeout_secs: u64,
     mcp_bridge: Option<McpBridgeConfig>,
     emit_caller_trace_headers: bool,
@@ -397,14 +577,12 @@ impl AcpClientDriver {
     /// drivers) wins over the `LIBREFANG_*_ACP_PATH` env var, which wins over the default
     /// adapter name. The permission policy comes from [`PERMISSION_POLICY_ENV`].
     pub fn new(kind: AcpAgentKind, command: Option<String>) -> Self {
-        let command = command
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                std::env::var(kind.path_env())
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
-            .unwrap_or_else(|| kind.default_command().to_string());
+        let command = resolve_adapter_command(kind, command.as_deref());
+        let session_mode = match std::env::var(SESSION_MODE_ENV) {
+            Ok(v) if v.trim().is_empty() => None,
+            Ok(v) => Some(v.trim().to_string()),
+            Err(_) => kind.default_session_mode().map(str::to_string),
+        };
         let args = std::env::var(kind.args_env())
             .map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default();
@@ -413,7 +591,11 @@ impl AcpClientDriver {
             command,
             args,
             policy: PermissionPolicy::from_env(),
-            cwd: std::env::var_os(CWD_ENV).map(PathBuf::from),
+            cwd: std::env::var_os(CWD_ENV)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            session_mode,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
             message_timeout_secs: crate::cli_process::DEFAULT_MESSAGE_TIMEOUT_SECS,
             mcp_bridge: None,
             emit_caller_trace_headers: true,
@@ -437,6 +619,23 @@ impl AcpClientDriver {
     pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
         self.cwd = Some(cwd);
         self
+    }
+
+    /// Set the session mode enforced after `session/new` (`None` keeps the agent's own).
+    pub fn with_session_mode(mut self, mode: Option<String>) -> Self {
+        self.session_mode = mode;
+        self
+    }
+
+    /// How long to wait for the agent to acknowledge `session/cancel`.
+    pub fn with_cancel_grace(mut self, grace: Duration) -> Self {
+        self.cancel_grace = grace;
+        self
+    }
+
+    /// The session mode this driver enforces.
+    pub fn session_mode(&self) -> Option<&str> {
+        self.session_mode.as_deref()
     }
 
     /// Set the per-request timeout.
@@ -475,14 +674,21 @@ impl AcpClientDriver {
             .collect()
     }
 
-    fn build_command(&self, request: &CompletionRequest) -> tokio::process::Command {
+    fn build_command(
+        &self,
+        request: &CompletionRequest,
+        cwd: &std::path::Path,
+    ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.command);
         cmd.args(&self.args);
+        cmd.current_dir(cwd);
+        // Allowlist, not the inherited denylist: start from an empty environment.
+        cmd.env_clear();
+        cmd.envs(allowed_adapter_env(self.kind, std::env::vars()));
         match self.kind {
             AcpAgentKind::ClaudeCode => {
-                // Same filter as the claude_code driver: strips other providers' keys and
-                // secret-suffixed vars, keeps CLAUDE_* / ANTHROPIC_* (incl. ANTHROPIC_BASE_URL,
-                // CLAUDE_CODE_EXECUTABLE) so model calls can go to the gateway.
+                // On top of the allowlist, the claude_code driver's filter keeps its OAuth
+                // precedence (drops ANTHROPIC_API_KEY when a subscription login exists).
                 let filter = super::claude_code::ClaudeCodeDriver::new(None, false);
                 filter.apply_env_filter(&mut cmd);
                 super::claude_code::ClaudeCodeDriver::ensure_home_env(&mut cmd);
@@ -491,7 +697,6 @@ impl AcpClientDriver {
                 }
             }
             AcpAgentKind::Codex => {
-                // Same filter as the codex_cli driver: keeps OPENAI_* / CODEX_*.
                 super::codex_cli::CodexCliDriver::apply_env_filter(&mut cmd);
             }
         }
@@ -515,11 +720,26 @@ impl AcpClientDriver {
         cmd
     }
 
-    fn session_cwd(&self) -> PathBuf {
-        self.cwd
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/"))
+    /// The session working directory: the configured one (must exist), else a fresh empty
+    /// scratch directory that is removed when the returned guard drops.
+    fn session_cwd(&self) -> Result<(PathBuf, Option<ScratchDir>), LlmError> {
+        if let Some(dir) = &self.cwd {
+            if !dir.is_dir() {
+                return Err(LlmError::Http(format!(
+                    "ACP session cwd {} does not exist or is not a directory",
+                    dir.display()
+                )));
+            }
+            return Ok((dir.clone(), None));
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "librefang-acp-{}-{}",
+            self.kind.label(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| LlmError::Http(format!("failed to create ACP scratch cwd: {e}")))?;
+        Ok((dir.clone(), Some(ScratchDir(dir))))
     }
 }
 
@@ -546,6 +766,8 @@ async fn run_turn(
         cwd,
         mcp_servers,
         prompt,
+        session_mode,
+        cancel_grace,
     } = input;
     agent_client_protocol::Client
         .builder()
@@ -587,10 +809,32 @@ async fn run_turn(
                 mcp_servers
             };
             let session = connection
-                .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+                .send_request(
+                    NewSessionRequest::new(cwd)
+                        .mcp_servers(mcp_servers)
+                        .meta(session_meta(kind)),
+                )
                 .block_task()
                 .await?;
             let session_id = session.session_id;
+            match plan_session_mode(session_mode.as_deref(), session.modes.as_ref())
+                .map_err(agent_client_protocol::util::internal_error)?
+            {
+                ModeAction::Keep => {}
+                ModeAction::AgentHasNoModes => warn!(
+                    agent = kind.label(),
+                    required = session_mode.as_deref().unwrap_or(""),
+                    "ACP agent reports no session modes; mode not enforced"
+                ),
+                ModeAction::Set => {
+                    let mode = session_mode.clone().unwrap_or_default();
+                    info!(agent = kind.label(), session_id = %session_id, mode = %mode, "setting ACP session mode");
+                    connection
+                        .send_request(SetSessionModeRequest::new(session_id.clone(), mode))
+                        .block_task()
+                        .await?;
+                }
+            }
             let prompt_fut = connection
                 .send_request(PromptRequest::new(
                     session_id.clone(),
@@ -605,7 +849,7 @@ async fn run_turn(
                     info!(agent = kind.label(), session_id = %session_id, "sending ACP session/cancel");
                     connection.send_notification(CancelNotification::new(session_id.clone()))?;
                     cancel_sent = true;
-                    match tokio::time::timeout(CANCEL_GRACE, &mut prompt_fut).await {
+                    match tokio::time::timeout(cancel_grace, &mut prompt_fut).await {
                         Ok(r) => r?,
                         Err(_) => return Err(agent_client_protocol::util::internal_error(
                             "agent did not acknowledge session/cancel",
@@ -652,7 +896,8 @@ impl LlmDriver for AcpClientDriver {
         };
         let prompt = build_prompt_text(&request);
 
-        let mut cmd = self.build_command(&request);
+        let (cwd, _scratch) = self.session_cwd()?;
+        let mut cmd = self.build_command(&request, &cwd);
         let mut child = cmd.spawn().map_err(|e| {
             LlmError::Http(format!(
                 "ACP adapter '{}' not found or failed to start ({e}). Install it: {}",
@@ -690,9 +935,11 @@ impl LlmDriver for AcpClientDriver {
             self.kind,
             self.policy.clone(),
             TurnInput {
-                cwd: self.session_cwd(),
+                cwd,
                 mcp_servers,
                 prompt,
+                session_mode: self.session_mode.clone(),
+                cancel_grace: self.cancel_grace,
             },
             ev_tx,
             Arc::clone(&cancel),
@@ -795,12 +1042,10 @@ impl LlmDriver for AcpClientDriver {
     }
 }
 
-/// Whether the adapter for `kind` resolves on PATH (or via its env override).
-pub fn acp_adapter_available(kind: AcpAgentKind) -> bool {
-    let command = std::env::var(kind.path_env())
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| kind.default_command().to_string());
+/// Whether the adapter for `kind` resolves, using the same precedence as the driver:
+/// `configured` (the provider's `base_url`), then the env override, then PATH.
+pub fn acp_adapter_available(kind: AcpAgentKind, configured: Option<&str>) -> bool {
+    let command = resolve_adapter_command(kind, configured);
     let path = std::path::Path::new(&command);
     if path.components().count() > 1 {
         return path.is_file();
@@ -938,6 +1183,162 @@ mod tests {
         assert_eq!(
             map_stop_reason(&AcpStopReason::Refusal),
             StopReason::ContentFiltered
+        );
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn keys(env: &[(String, String)]) -> Vec<&str> {
+        env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    const PARENT_ENV: &[(&str, &str)] = &[
+        ("PATH", "/usr/bin"),
+        ("HOME", "/home/u"),
+        ("LC_ALL", "C.UTF-8"),
+        ("ANTHROPIC_BASE_URL", "http://gw:8080"),
+        ("ANTHROPIC_AUTH_TOKEN", "gw-key"),
+        ("CLAUDE_CODE_EXECUTABLE", "/opt/claude"),
+        ("OPENAI_BASE_URL", "http://gw:8080/v1"),
+        ("CODEX_HOME", "/home/u/.codex"),
+        ("AWS_SECRET_ACCESS_KEY", "aws"),
+        ("STRIPE_API_KEY", "stripe"),
+        ("LIBREFANG_API_KEY", "lf"),
+        ("GITHUB_TOKEN", "gh"),
+        ("IS_SANDBOX", "1"),
+        ("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS", "1"),
+    ];
+
+    #[test]
+    fn claude_env_is_an_allowlist() {
+        let env = allowed_adapter_env(AcpAgentKind::ClaudeCode, vars(PARENT_ENV));
+        assert_eq!(
+            keys(&env),
+            [
+                "PATH",
+                "HOME",
+                "LC_ALL",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_EXECUTABLE"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_env_is_an_allowlist() {
+        let env = allowed_adapter_env(AcpAgentKind::Codex, vars(PARENT_ENV));
+        assert_eq!(
+            keys(&env),
+            ["PATH", "HOME", "LC_ALL", "OPENAI_BASE_URL", "CODEX_HOME"]
+        );
+    }
+
+    #[test]
+    fn unlisted_secrets_and_bypass_switches_never_pass() {
+        for kind in [AcpAgentKind::ClaudeCode, AcpAgentKind::Codex] {
+            for key in [
+                "AWS_SECRET_ACCESS_KEY",
+                "STRIPE_API_KEY",
+                "LIBREFANG_API_KEY",
+                "FOO_API_KEY",
+                "GITHUB_TOKEN",
+                "IS_SANDBOX",
+                "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS",
+                "CODEX_BYPASS_PERMISSIONS",
+            ] {
+                assert!(
+                    !adapter_env_key_allowed(kind, key),
+                    "{key} must not reach the {kind:?} adapter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_adapter_command_precedence() {
+        assert_eq!(
+            resolve_adapter_command(AcpAgentKind::Codex, Some(" /opt/codex-acp ")),
+            "/opt/codex-acp"
+        );
+        // Blank configured value falls through (env var unset in tests by default).
+        if std::env::var(AcpAgentKind::Codex.path_env()).is_err() {
+            assert_eq!(
+                resolve_adapter_command(AcpAgentKind::Codex, Some("  ")),
+                "codex-acp"
+            );
+            assert_eq!(
+                resolve_adapter_command(AcpAgentKind::Codex, None),
+                "codex-acp"
+            );
+        }
+    }
+
+    #[test]
+    fn availability_honours_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = dir.path().join("my-claude-acp");
+        std::fs::write(&adapter, "").unwrap();
+        let configured = adapter.to_string_lossy().into_owned();
+        assert!(acp_adapter_available(
+            AcpAgentKind::ClaudeCode,
+            Some(&configured)
+        ));
+        let missing = dir.path().join("absent").to_string_lossy().into_owned();
+        assert!(!acp_adapter_available(
+            AcpAgentKind::ClaudeCode,
+            Some(&missing)
+        ));
+    }
+
+    #[test]
+    fn claude_session_meta_disables_bypass() {
+        let meta = session_meta(AcpAgentKind::ClaudeCode).expect("claude meta");
+        assert_eq!(
+            meta["claudeCode"]["options"]["allowDangerouslySkipPermissions"],
+            serde_json::json!(false)
+        );
+        assert!(session_meta(AcpAgentKind::Codex).is_none());
+    }
+
+    fn mode_state(current: &str, available: &[&str]) -> SessionModeState {
+        use agent_client_protocol::schema::v1::SessionMode;
+        SessionModeState::new(
+            current.to_string(),
+            available
+                .iter()
+                .map(|m| SessionMode::new(m.to_string(), m.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn session_mode_plan_fails_closed() {
+        let st = mode_state("acceptEdits", &["default", "acceptEdits"]);
+        assert_eq!(
+            plan_session_mode(Some("default"), Some(&st)),
+            Ok(ModeAction::Set)
+        );
+        let st = mode_state("default", &["default"]);
+        assert_eq!(
+            plan_session_mode(Some("default"), Some(&st)),
+            Ok(ModeAction::Keep)
+        );
+        let st = mode_state("bypassPermissions", &["bypassPermissions"]);
+        assert!(plan_session_mode(Some("default"), Some(&st)).is_err());
+        assert_eq!(
+            plan_session_mode(Some("default"), None),
+            Ok(ModeAction::AgentHasNoModes)
+        );
+        assert_eq!(plan_session_mode(None, Some(&st)), Ok(ModeAction::Keep));
+        assert_eq!(
+            AcpAgentKind::ClaudeCode.default_session_mode(),
+            Some("default")
         );
     }
 

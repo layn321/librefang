@@ -1168,9 +1168,9 @@ pub fn cli_provider_available(name: &str) -> bool {
         "codex-cli" => codex_cli::codex_cli_available(),
         "codewhale" => codewhale::codewhale_available(),
         "claude-code-acp" => {
-            acp_client::acp_adapter_available(acp_client::AcpAgentKind::ClaudeCode)
+            acp_client::acp_adapter_available(acp_client::AcpAgentKind::ClaudeCode, None)
         }
-        "codex-acp" => acp_client::acp_adapter_available(acp_client::AcpAgentKind::Codex),
+        "codex-acp" => acp_client::acp_adapter_available(acp_client::AcpAgentKind::Codex, None),
         _ => false,
     }
 }
@@ -1203,7 +1203,13 @@ pub fn is_proxied_via_env(env_vars: &[&str], official_hosts: &[&str]) -> bool {
 pub fn is_cli_provider(name: &str) -> bool {
     matches!(
         name,
-        "claude-code" | "qwen-code" | "gemini-cli" | "codex-cli" | "codewhale"
+        "claude-code"
+            | "qwen-code"
+            | "gemini-cli"
+            | "codex-cli"
+            | "codewhale"
+            | "claude-code-acp"
+            | "codex-acp"
     )
 }
 
@@ -1455,6 +1461,21 @@ mod tests {
         assert!(providers.contains(&"claude-code-acp"));
         assert!(providers.contains(&"codex-acp"));
         assert_eq!(providers.len(), 46);
+    }
+
+    #[test]
+    fn cli_provider_predicates_agree_for_every_registered_provider() {
+        // `is_cli_provider` gates the catalog's keyless auth-status path; it must cover
+        // every subprocess (coding-agent) provider in the registry, including the ACP ones.
+        for p in super::known_providers() {
+            assert_eq!(
+                super::is_cli_provider(p),
+                super::is_coding_agent_provider(p),
+                "is_cli_provider and is_coding_agent_provider disagree for {p}"
+            );
+        }
+        assert!(super::is_cli_provider("claude-code-acp"));
+        assert!(super::is_cli_provider("codex-acp"));
     }
 
     #[test]

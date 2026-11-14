@@ -250,18 +250,29 @@ LibreFang spawns an ACP adapter, which drives the real CLI as a long-lived agent
 2. Install the adapter:
    - Claude Code: `npm install -g @agentclientprotocol/claude-agent-acp` (formerly `@zed-industries/claude-code-acp`; its `claude-code-acp` binary also works if you point the path at it).
    - Codex: `npm install -g @agentclientprotocol/codex-acp`.
-3. Set `[default_model] provider = "claude-code-acp"` (or `"codex-acp"`).
+3. Set `[default_model] provider = "claude-code-acp"` (or `"codex-acp"`), and set `LIBREFANG_ACP_CWD` to the directory the agent should work in.
+
+These providers are not yet in the model catalog (the provider TOMLs live in `librefang/librefang-registry`), so configure them by provider id.
 
 **Configuration:**
 
 | Setting | Effect |
 |---|---|
-| `base_url` (or `[provider_urls] claude-code-acp = "/path/to/adapter"`) | Adapter executable. Wins over the env var below. |
+| `base_url` (or `[provider_urls] claude-code-acp = "/path/to/adapter"`) | Adapter executable. Wins over the env var below; also used by the availability probe. |
 | `LIBREFANG_CLAUDE_ACP_PATH` / `LIBREFANG_CODEX_ACP_PATH` | Adapter executable when no config value is set. Default `claude-agent-acp` / `codex-acp` on PATH. |
-| `LIBREFANG_CLAUDE_ACP_ARGS` / `LIBREFANG_CODEX_ACP_ARGS` | Extra adapter arguments, whitespace-separated. |
+| `LIBREFANG_CLAUDE_ACP_ARGS` / `LIBREFANG_CODEX_ACP_ARGS` | Extra adapter arguments, whitespace-separated (no shell). |
+| `LIBREFANG_ACP_CWD` | Working directory for the adapter process and `session/new`. It must exist. **Unset: a fresh, empty scratch directory per turn, removed afterwards** (never the daemon's directory). |
 | `LIBREFANG_ACP_PERMISSION_POLICY` | How `session/request_permission` is answered: `deny-all` (**default**), `allow-all`, or `allow:<kind>,<kind>` using ACP tool kinds (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`). Every decision is logged at `info`. |
-| `LIBREFANG_ACP_CWD` | Working directory sent in `session/new` (default: the daemon's cwd). |
-| `CLAUDE_CODE_EXECUTABLE` | Passed through; the Claude adapter uses it to pick the Claude Code binary. |
-| `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, other `CLAUDE_*` / `ANTHROPIC_*` / `OPENAI_*` / `CODEX_*` | Passed through, so the CLI's model calls can go to a gateway. |
+| `LIBREFANG_ACP_SESSION_MODE` | ACP session mode enforced right after `session/new` with `session/set_mode`. Default `default` for Claude; none for Codex. Empty keeps the agent's own mode. If the agent offers modes but not this one, the turn fails. |
 
-**Notes:** The adapter's environment goes through the same filter as the `claude-code` and `codex-cli` drivers: other providers' API keys and `*_SECRET` / `*_TOKEN` / `*_PASSWORD` variables are removed. The adapter runs in its own process group, and the whole group is killed on timeout or when the request is dropped. If the caller stops reading the stream, the driver sends `session/cancel` first. A `claude-code-acp/<model>` model id sets `ANTHROPIC_MODEL` for the Claude adapter; bare `claude-code-acp` leaves model choice to the CLI.
+**What the permission policy does and does not cover.** The policy answers only the permission requests the adapter actually sends. Claude Code decides some tool calls itself before asking: its permission mode and the allow rules in your Claude settings apply first. The driver therefore also:
+- sends `_meta.claudeCode.options.allowDangerouslySkipPermissions = false` in `session/new`, which turns bypass off for the session in `claude-agent-acp` (0.84.0 `dist/acp-agent.js:6486-6488`; a `bypassPermissions` default then falls back to `default`);
+- switches the session to the `default` mode (`session/set_mode`), so a `defaultMode` such as `acceptEdits` or `dontAsk` in your Claude settings does not apply;
+- keeps any variable containing `DANGEROUSLY`, `SKIP_PERMISSIONS` or `BYPASS_PERMISSIONS`, and `IS_SANDBOX`, out of the adapter's environment, and never passes a skip-permissions flag;
+- runs in a scratch directory by default, so no project's `.claude/settings.json` allow rules are picked up.
+
+Allow rules in your **user** Claude settings (`~/.claude/settings.json` `permissions.allow`) still apply and are never seen by the policy. With `allow:<kind>`, the kind is the one the agent reports; a mislabelled call is judged by its label. For Codex, no session mode is enforced and `codex-acp`'s own approval behaviour has not been verified, so treat `deny-all` as covering only what it asks about.
+
+**Environment.** The adapter starts from an empty environment plus an allowlist: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `XDG_*_HOME` / `XDG_RUNTIME_DIR`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, the `HTTP(S)_PROXY` / `NO_PROXY` / `ALL_PROXY` variables, the Windows process basics, and the adapter's own prefixes: `CLAUDE_*` and `ANTHROPIC_*` for Claude (including `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_EXECUTABLE`), `OPENAI_*` and `CODEX_*` for Codex (including `OPENAI_BASE_URL`). Everything else is dropped, for example `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, other providers' keys and any unlisted `*_API_KEY`. Variables under the allowed prefixes pass even when they hold secrets, because that is how the CLI authenticates to a gateway. When a Claude subscription login exists, `ANTHROPIC_API_KEY` is also dropped so the login wins (same rule as the `claude-code` driver).
+
+**Notes:** The MCP bridge headers (`X-API-Key`, agent identity) are passed to the agent in `session/new`, as the `claude-code` driver passes them in `--mcp-config`; the agent can read them. The adapter runs in its own process group. If the caller stops reading the stream, the driver sends `session/cancel` and waits 5 s; after that, and on timeout (no `session/cancel` is sent then), the whole group is killed with SIGKILL. A `claude-code-acp/<model>` model id sets `ANTHROPIC_MODEL` for the Claude adapter; bare `claude-code-acp` leaves model choice to the CLI.
