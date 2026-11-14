@@ -13,6 +13,10 @@ argv[2] (cancel marker path, `hang` mode only):
   grandchild_hang   start a `sleep` grandchild, write its pid to the marker file,
                     send one chunk, then never answer
   no_default_mode   session/new reports only `bypassPermissions` (no `default`)
+  gateway      like claude-agent-acp 0.84.0: offer the `gateway` auth method only
+               when the client sets clientCapabilities.auth._meta.gateway, and
+               refuse session/new with authRequired until `authenticate` ran;
+               then behave as `normal` and report what the gateway call carried
 """
 
 import subprocess
@@ -61,6 +65,15 @@ def request(method, params):
             return msg
 
 
+def env_custom_headers():
+    out = {}
+    for line in os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip():
+            out[name.strip()] = value.strip()
+    return out
+
+
 def handle_prompt(rid, params, state):
     sid = params["sessionId"]
     prompt_text = "".join(b.get("text", "") for b in params.get("prompt", []))
@@ -97,6 +110,14 @@ def handle_prompt(rid, params, state):
     chunk(sid, "|mode:" + state.get("mode", "<none>"))
     chunk(sid, "|bypass_allowed:" + state.get("bypass", "<unset>"))
     chunk(sid, "|cwd_match:" + ("yes" if os.getcwd() == os.path.realpath(state.get("cwd", "")) else "no"))
+    gw = state.get("gateway")
+    if gw is not None:
+        headers = gw.get("headers") or {}
+        chunk(sid, "|gw_base:" + str(gw.get("baseUrl")))
+        chunk(sid, "|gw_headers:" + ",".join(sorted(headers)))
+        # Header values are echoed only as a yes/no against this process's own env,
+        # never as text.
+        chunk(sid, "|gw_match:" + ("yes" if headers == env_custom_headers() else "no"))
     send({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -135,12 +156,23 @@ def main():
         rid = msg.get("id")
         params = msg.get("params", {})
         if method == "initialize":
+            caps = params.get("clientCapabilities", {}) or {}
+            offers_gateway = MODE == "gateway" and \
+                ((caps.get("auth") or {}).get("_meta") or {}).get("gateway") is True
+            methods = [{"id": "gateway", "name": "Custom model gateway",
+                        "_meta": {"gateway": {"protocol": "anthropic"}}}] if offers_gateway else []
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": 1,
                 "agentCapabilities": {"mcpCapabilities": {"http": True}},
                 "agentInfo": {"name": "fake-acp-agent", "version": "0.0.1"},
-                "authMethods": [],
+                "authMethods": methods,
             }})
+        elif method == "authenticate" and MODE == "gateway" and params.get("methodId") == "gateway":
+            state["gateway"] = (params.get("_meta") or {}).get("gateway") or {}
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method == "session/new" and MODE == "gateway" and "gateway" not in state:
+            send({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32000, "message": "Authentication required"}})
         elif method == "session/new":
             state["mcp"] = [s.get("name", "") for s in params.get("mcpServers", [])]
             state["cwd"] = params.get("cwd", "")

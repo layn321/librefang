@@ -24,10 +24,10 @@
 
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ClientCapabilities, ContentBlock as AcpContentBlock,
-    FileSystemCapabilities, HttpHeader, InitializeRequest, McpServer, McpServerHttp, Meta,
-    NewSessionRequest, PermissionOption, PermissionOptionKind, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    AuthCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities,
+    ContentBlock as AcpContentBlock, FileSystemCapabilities, HttpHeader, InitializeRequest,
+    McpServer, McpServerHttp, Meta, NewSessionRequest, PermissionOption, PermissionOptionKind,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionModeState, SessionNotification, SessionUpdate,
     SetSessionModeRequest, StopReason as AcpStopReason, TextContent, ToolKind, Usage as AcpUsage,
 };
@@ -477,6 +477,125 @@ fn session_meta(kind: AcpAgentKind) -> Option<Meta> {
     }
 }
 
+/// ACP auth method id `claude-agent-acp` offers for an Anthropic-protocol gateway
+/// (`dist/acp-agent.js:1151-1160`), advertised only when the client sets
+/// `clientCapabilities.auth._meta.gateway = true` (`:1150`, `:1288-1291`).
+const GATEWAY_AUTH_METHOD: &str = "gateway";
+
+/// A model gateway the Claude adapter is told about through ACP `authenticate`.
+///
+/// Built from the same `ANTHROPIC_*` variables an operator already sets for the
+/// CLI. Header values are credentials: `Debug` prints header names only, and
+/// nothing in this module logs a value.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct GatewayAuth {
+    base_url: String,
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for GatewayAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayAuth")
+            .field("base_url", &self.base_url)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl GatewayAuth {
+    /// Gateway config from an environment, or `None` when no gateway is set.
+    ///
+    /// Needs `ANTHROPIC_BASE_URL` plus at least one credential header. Headers come
+    /// from `ANTHROPIC_CUSTOM_HEADERS` (newline-separated `Name: Value`, the CLI's own
+    /// format). `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` become `Authorization`
+    /// and `x-api-key` unless a custom header already sets them, because the adapter's
+    /// gateway route blanks both variables for the CLI (`dist/acp-agent.js:7299-7311`,
+    /// `:7343-7347`) and would otherwise drop them.
+    pub(crate) fn from_env(
+        kind: AcpAgentKind,
+        vars: impl IntoIterator<Item = (String, String)>,
+    ) -> Option<Self> {
+        if kind != AcpAgentKind::ClaudeCode {
+            return None;
+        }
+        let vars: std::collections::HashMap<String, String> = vars.into_iter().collect();
+        let base_url = vars.get("ANTHROPIC_BASE_URL")?.trim().to_string();
+        if base_url.is_empty() {
+            return None;
+        }
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(raw) = vars.get("ANTHROPIC_CUSTOM_HEADERS") {
+            for line in raw.lines() {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim();
+                if !name.is_empty() {
+                    headers.insert(name.to_string(), value.trim().to_string());
+                }
+            }
+        }
+        let has = |headers: &std::collections::BTreeMap<String, String>, wanted: &str| {
+            headers.keys().any(|k| k.eq_ignore_ascii_case(wanted))
+        };
+        if let Some(token) = vars.get("ANTHROPIC_AUTH_TOKEN").filter(|v| !v.is_empty()) {
+            if !has(&headers, "authorization") {
+                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+            }
+        }
+        if let Some(key) = vars.get("ANTHROPIC_API_KEY").filter(|v| !v.is_empty()) {
+            if !has(&headers, "x-api-key") {
+                headers.insert("x-api-key".to_string(), key.clone());
+            }
+        }
+        if headers.is_empty() {
+            return None;
+        }
+        Some(Self { base_url, headers })
+    }
+
+    /// `authenticate` params `claude-agent-acp` reads (`dist/acp-agent.js:1401-1413`).
+    fn authenticate_meta(&self) -> Option<Meta> {
+        serde_json::json!({ "gateway": { "baseUrl": self.base_url, "headers": self.headers } })
+            .as_object()
+            .cloned()
+    }
+}
+
+/// Client capabilities for `initialize`. A gateway turns on
+/// `auth._meta.gateway` so the Claude adapter offers its gateway auth method.
+fn client_capabilities(gateway: Option<&GatewayAuth>) -> ClientCapabilities {
+    // No fs / terminal delegation: the agent uses its own tools.
+    let caps = ClientCapabilities::new()
+        .fs(FileSystemCapabilities::new())
+        .terminal(false);
+    match gateway {
+        Some(_) => caps.auth(
+            AuthCapabilities::new()
+                .meta(serde_json::json!({ "gateway": true }).as_object().cloned()),
+        ),
+        None => caps,
+    }
+}
+
+/// Whether the agent advertised `id` as an `authenticate`-able method.
+fn advertises_auth_method(methods: &[AuthMethod], id: &str) -> bool {
+    methods
+        .iter()
+        .any(|m| matches!(m, AuthMethod::Agent(a) if &*a.id.0 == id))
+}
+
+fn auth_method_ids(methods: &[AuthMethod]) -> Vec<String> {
+    methods
+        .iter()
+        .map(|m| match m {
+            AuthMethod::Agent(a) => a.id.0.to_string(),
+            AuthMethod::Terminal(t) => format!("terminal:{}", t.id.0),
+            _ => "unknown".to_string(),
+        })
+        .collect()
+}
+
 /// What to do about the session mode after `session/new`.
 #[derive(Debug, PartialEq, Eq)]
 enum ModeAction {
@@ -548,6 +667,7 @@ struct TurnInput {
     prompt: String,
     session_mode: Option<String>,
     cancel_grace: Duration,
+    gateway: Option<GatewayAuth>,
 }
 
 /// Outcome of one prompt turn.
@@ -768,6 +888,7 @@ async fn run_turn(
         prompt,
         session_mode,
         cancel_grace,
+        gateway,
     } = input;
     agent_client_protocol::Client
         .builder()
@@ -789,16 +910,40 @@ async fn run_turn(
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
             let init = connection
                 .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                        // No fs / terminal delegation: the agent uses its own tools.
-                        ClientCapabilities::new()
-                            .fs(FileSystemCapabilities::new())
-                            .terminal(false),
-                    ),
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(client_capabilities(gateway.as_ref())),
                 )
                 .block_task()
                 .await?;
-            debug!(agent = kind.label(), info = ?init.agent_info, "ACP agent initialized");
+            debug!(
+                agent = kind.label(),
+                info = ?init.agent_info,
+                auth_methods = ?auth_method_ids(&init.auth_methods),
+                "ACP agent initialized"
+            );
+            if let Some(gateway) = gateway.as_ref() {
+                if advertises_auth_method(&init.auth_methods, GATEWAY_AUTH_METHOD) {
+                    // Logs the URL and header names; never a header value.
+                    info!(
+                        agent = kind.label(),
+                        gateway = ?gateway,
+                        "authenticating ACP agent against the model gateway"
+                    );
+                    connection
+                        .send_request(
+                            AuthenticateRequest::new(GATEWAY_AUTH_METHOD)
+                                .meta(gateway.authenticate_meta()),
+                        )
+                        .block_task()
+                        .await?;
+                } else {
+                    warn!(
+                        agent = kind.label(),
+                        auth_methods = ?auth_method_ids(&init.auth_methods),
+                        "ACP agent did not offer gateway auth; relying on ANTHROPIC_* env passthrough"
+                    );
+                }
+            }
             let mcp_servers = if !mcp_servers.is_empty() && !init.agent_capabilities.mcp_capabilities.http {
                 warn!(
                     agent = kind.label(),
@@ -940,6 +1085,10 @@ impl LlmDriver for AcpClientDriver {
                 prompt,
                 session_mode: self.session_mode.clone(),
                 cancel_grace: self.cancel_grace,
+                gateway: GatewayAuth::from_env(
+                    self.kind,
+                    allowed_adapter_env(self.kind, std::env::vars()),
+                ),
             },
             ev_tx,
             Arc::clone(&cancel),
@@ -1350,5 +1499,123 @@ mod tests {
         );
         assert_eq!(model_override("claude-code-acp", "claude-code-acp/"), None);
         assert_eq!(model_override("", "claude-code-acp/"), None);
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn gateway_needs_base_url_and_a_credential_header() {
+        let kind = AcpAgentKind::ClaudeCode;
+        assert_eq!(GatewayAuth::from_env(kind, env(&[])), None);
+        assert_eq!(
+            GatewayAuth::from_env(kind, env(&[("ANTHROPIC_BASE_URL", "http://gw/anthropic")])),
+            None,
+            "a base URL alone keeps the env passthrough path"
+        );
+        assert_eq!(
+            GatewayAuth::from_env(kind, env(&[("ANTHROPIC_CUSTOM_HEADERS", "x-k: v")])),
+            None
+        );
+        assert_eq!(
+            GatewayAuth::from_env(
+                AcpAgentKind::Codex,
+                env(&[
+                    ("ANTHROPIC_BASE_URL", "http://gw"),
+                    ("ANTHROPIC_CUSTOM_HEADERS", "x-k: v")
+                ])
+            ),
+            None,
+            "codex has no Anthropic gateway"
+        );
+    }
+
+    #[test]
+    fn gateway_parses_custom_headers_and_maps_token_and_key() {
+        let gw = GatewayAuth::from_env(
+            AcpAgentKind::ClaudeCode,
+            env(&[
+                ("ANTHROPIC_BASE_URL", " http://gw/anthropic "),
+                (
+                    "ANTHROPIC_CUSTOM_HEADERS",
+                    "x-litellm-api-key: sk-one\r\nX-Route:lane\nbogus\n",
+                ),
+                ("ANTHROPIC_AUTH_TOKEN", "tok"),
+                ("ANTHROPIC_API_KEY", "key"),
+            ]),
+        )
+        .expect("gateway");
+        assert_eq!(gw.base_url, "http://gw/anthropic");
+        let names: Vec<_> = gw.headers.keys().cloned().collect();
+        assert_eq!(
+            names,
+            ["Authorization", "X-Route", "x-api-key", "x-litellm-api-key"]
+        );
+        assert_eq!(gw.headers["x-litellm-api-key"], "sk-one");
+        assert_eq!(gw.headers["X-Route"], "lane");
+        assert_eq!(gw.headers["Authorization"], "Bearer tok");
+        assert_eq!(gw.headers["x-api-key"], "key");
+
+        // A custom header already carrying the credential wins over the variables.
+        let gw = GatewayAuth::from_env(
+            AcpAgentKind::ClaudeCode,
+            env(&[
+                ("ANTHROPIC_BASE_URL", "http://gw"),
+                (
+                    "ANTHROPIC_CUSTOM_HEADERS",
+                    "authorization: Bearer hdr\nX-Api-Key: hk",
+                ),
+                ("ANTHROPIC_AUTH_TOKEN", "tok"),
+                ("ANTHROPIC_API_KEY", "key"),
+            ]),
+        )
+        .expect("gateway");
+        assert_eq!(gw.headers.len(), 2);
+        assert_eq!(gw.headers["authorization"], "Bearer hdr");
+        assert_eq!(gw.headers["X-Api-Key"], "hk");
+    }
+
+    #[test]
+    fn gateway_debug_never_prints_header_values() {
+        let gw = GatewayAuth::from_env(
+            AcpAgentKind::ClaudeCode,
+            env(&[
+                ("ANTHROPIC_BASE_URL", "http://gw"),
+                (
+                    "ANTHROPIC_CUSTOM_HEADERS",
+                    "x-litellm-api-key: sk-SECRET-VALUE",
+                ),
+                ("ANTHROPIC_AUTH_TOKEN", "TOKEN-SECRET"),
+            ]),
+        )
+        .expect("gateway");
+        let shown = format!("{gw:?}");
+        assert!(shown.contains("x-litellm-api-key"), "{shown}");
+        assert!(!shown.contains("SECRET"), "header value leaked: {shown}");
+    }
+
+    #[test]
+    fn gateway_meta_matches_adapter_shape() {
+        let gw = GatewayAuth::from_env(
+            AcpAgentKind::ClaudeCode,
+            env(&[
+                ("ANTHROPIC_BASE_URL", "http://gw"),
+                ("ANTHROPIC_CUSTOM_HEADERS", "x-k: v"),
+            ]),
+        )
+        .expect("gateway");
+        let meta = serde_json::Value::Object(gw.authenticate_meta().expect("meta"));
+        assert_eq!(
+            meta,
+            serde_json::json!({ "gateway": { "baseUrl": "http://gw", "headers": { "x-k": "v" } } })
+        );
+        let caps = serde_json::to_value(client_capabilities(Some(&gw))).unwrap();
+        assert_eq!(caps["auth"]["_meta"]["gateway"], serde_json::json!(true));
+        let caps = serde_json::to_value(client_capabilities(None)).unwrap();
+        assert!(caps["auth"]["_meta"].is_null(), "{caps}");
     }
 }

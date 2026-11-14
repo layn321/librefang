@@ -385,3 +385,61 @@ async fn timeout_kills_process_group_including_grandchild() {
         "grandchild {pid} survived the timeout kill"
     );
 }
+
+/// Fake test values only: the fake agent never sends them anywhere.
+const GW_BASE: &str = "http://litellm-gateway.test:4000/anthropic";
+const GW_HEADERS: &str = "x-litellm-api-key: sk-fake-test-value\nX-Lane: acp-test";
+
+/// The live failure (layn321/librefang#1 @de93066): an adapter that only takes
+/// gateway credentials through ACP `authenticate` refuses `session/new` with
+/// "Authentication required". The driver must advertise gateway support, call
+/// `authenticate` with the base URL and headers from its env, then open the session.
+#[tokio::test]
+#[serial]
+async fn gateway_env_is_sent_through_authenticate_before_session_new() {
+    std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
+    std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
+    let d = driver("gateway", PermissionPolicy::AllowAll);
+    let result = d.complete(request("hello gateway")).await;
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+
+    let response = result.expect("turn completes once authenticate has run");
+    let text = response.text();
+    assert!(text.contains("echo:hello gateway"), "{text}");
+    assert!(
+        text.contains(&format!("|gw_base:{GW_BASE}")),
+        "base URL sent: {text}"
+    );
+    assert!(
+        text.contains("|gw_headers:X-Lane,x-litellm-api-key"),
+        "header names sent: {text}"
+    );
+    assert!(
+        text.contains("|gw_match:yes"),
+        "header values arrived intact: {text}"
+    );
+    assert!(
+        !text.contains("sk-fake-test-value"),
+        "value never echoed: {text}"
+    );
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+}
+
+/// Without gateway env there is nothing to authenticate with, so the gateway-only
+/// adapter refuses the session and the driver reports it, not a silent empty turn.
+#[tokio::test]
+#[serial]
+async fn gateway_only_agent_without_gateway_env_reports_auth_required() {
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+    let d = driver("gateway", PermissionPolicy::AllowAll);
+    let err = d
+        .complete(request("hello"))
+        .await
+        .expect_err("session/new is refused");
+    assert!(
+        err.to_string().contains("Authentication required"),
+        "auth error surfaced: {err}"
+    );
+}
