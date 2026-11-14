@@ -443,3 +443,102 @@ async fn gateway_only_agent_without_gateway_env_reports_auth_required() {
         "auth error surfaced: {err}"
     );
 }
+
+/// A `MakeWriter` that appends everything into one shared buffer.
+#[derive(Clone, Default)]
+struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// F9: the ACP crate logs whole outgoing JSON-RPC messages at debug/trace. With a
+/// subscriber at TRACE for every target, neither the gateway header value sent in
+/// `authenticate` nor the MCP bridge key sent in `session/new` may reach the log.
+#[tokio::test]
+#[serial]
+async fn trace_logging_never_contains_gateway_or_mcp_secrets() {
+    const MCP_KEY: &str = "mcp-fake-bridge-key";
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
+    std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
+    let d = driver("gateway", PermissionPolicy::AllowAll).with_mcp_bridge(McpBridgeConfig {
+        base_url: "http://127.0.0.1:4545".to_string(),
+        api_key: Some(MCP_KEY.to_string()),
+    });
+    let mut req = request("hello trace");
+    req.tools = Arc::new(vec![ToolDefinition {
+        name: "noop".to_string(),
+        description: "noop".to_string(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }]);
+    let result = d.complete(req).await;
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+    drop(_guard);
+
+    let response = result.expect("turn completes");
+    assert!(
+        response.text().contains("|gw_match:yes"),
+        "gateway call ran"
+    );
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    // The capture is live at TRACE: the driver's own debug line is there.
+    assert!(
+        log.contains("ACP agent initialized"),
+        "capture saw nothing: {log}"
+    );
+    assert!(
+        log.contains("authenticating ACP agent against the model gateway"),
+        "gateway info line present"
+    );
+    assert!(
+        !log.contains("sk-fake-test-value"),
+        "gateway header value reached the log"
+    );
+    assert!(!log.contains(MCP_KEY), "MCP bridge key reached the log");
+}
+
+/// LOW from the r3 review: an adapter that does not offer `gateway` gets no
+/// `authenticate` call; the driver warns and the turn still runs on env passthrough.
+#[tokio::test]
+#[serial]
+async fn agent_without_gateway_method_falls_back_to_env() {
+    std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
+    std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
+    let d = driver("normal", PermissionPolicy::AllowAll);
+    let result = d.complete(request("hello fallback")).await;
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+
+    let text = result.expect("turn completes without authenticate").text();
+    assert!(text.contains("echo:hello fallback"), "{text}");
+    assert!(
+        text.contains(&format!("|base_url:{GW_BASE}")),
+        "env passthrough still carries the base URL: {text}"
+    );
+    assert!(
+        !text.contains("|gw_base:"),
+        "no authenticate was sent to an agent that did not offer it: {text}"
+    );
+}

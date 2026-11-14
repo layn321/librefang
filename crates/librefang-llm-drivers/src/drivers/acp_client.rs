@@ -596,6 +596,86 @@ fn auth_method_ids(methods: &[AuthMethod]) -> Vec<String> {
         .collect()
 }
 
+/// Tracing target prefix of `agent-client-protocol` (and its schema crate).
+const ACP_CRATE_TARGET: &str = "agent_client_protocol";
+
+/// Whether a callsite belongs to the ACP crate and is more verbose than `info`.
+///
+/// `agent-client-protocol` 3.3.0 logs whole outgoing messages:
+/// `jsonrpc/outgoing_actor.rs:15` and `:37` (`debug!(?message)`) and
+/// `jsonrpc/transport_actor.rs:135`/`:145` (`trace!` of the JSON line). Those
+/// messages carry the gateway headers (`authenticate`) and the MCP bridge
+/// `X-API-Key` (`session/new`).
+fn acp_crate_capped(meta: &tracing::Metadata<'_>) -> bool {
+    meta.target().starts_with(ACP_CRATE_TARGET) && *meta.level() > tracing::Level::INFO
+}
+
+/// Forwards everything to the subscriber that was current when it was built,
+/// except ACP-crate callsites above `info`, which it reports as disabled.
+struct CapAcpCrateLogs {
+    inner: tracing::Dispatch,
+    max_level: tracing::level_filters::LevelFilter,
+}
+
+impl tracing::Subscriber for CapAcpCrateLogs {
+    fn register_callsite(
+        &self,
+        meta: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if acp_crate_capped(meta) {
+            // `sometimes`, not `never`: interest is cached per callsite across all
+            // dispatchers, so `never` would also silence it outside this turn.
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            self.inner.register_callsite(meta)
+        }
+    }
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        !acp_crate_capped(meta) && self.inner.enabled(meta)
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(self.max_level)
+    }
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        self.inner.new_span(span)
+    }
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        self.inner.record(span, values)
+    }
+    fn record_follows_from(&self, span: &tracing::span::Id, follows: &tracing::span::Id) {
+        self.inner.record_follows_from(span, follows)
+    }
+    fn event(&self, event: &tracing::Event<'_>) {
+        if !acp_crate_capped(event.metadata()) {
+            self.inner.event(event)
+        }
+    }
+    fn enter(&self, span: &tracing::span::Id) {
+        self.inner.enter(span)
+    }
+    fn exit(&self, span: &tracing::span::Id) {
+        self.inner.exit(span)
+    }
+    fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+        self.inner.clone_span(id)
+    }
+    fn try_close(&self, id: tracing::span::Id) -> bool {
+        self.inner.try_close(id)
+    }
+    fn current_span(&self) -> tracing_core::span::Current {
+        self.inner.current_span()
+    }
+}
+
+/// A dispatcher for one ACP turn: the current one, with the ACP crate capped at `info`.
+fn acp_capped_dispatch() -> tracing::Dispatch {
+    tracing::Dispatch::new(CapAcpCrateLogs {
+        inner: tracing::dispatcher::get_default(|d| d.clone()),
+        // Keep the process-wide static max level as it is rather than raising it.
+        max_level: tracing::level_filters::LevelFilter::current(),
+    })
+}
+
 /// What to do about the session mode after `session/new`.
 #[derive(Debug, PartialEq, Eq)]
 enum ModeAction {
@@ -1075,23 +1155,29 @@ impl LlmDriver for AcpClientDriver {
 
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Arc::new(tokio::sync::Notify::new());
-        let turn = run_turn(
-            transport,
-            self.kind,
-            self.policy.clone(),
-            TurnInput {
-                cwd,
-                mcp_servers,
-                prompt,
-                session_mode: self.session_mode.clone(),
-                cancel_grace: self.cancel_grace,
-                gateway: GatewayAuth::from_env(
-                    self.kind,
-                    allowed_adapter_env(self.kind, std::env::vars()),
-                ),
-            },
-            ev_tx,
-            Arc::clone(&cancel),
+        // The ACP crate logs whole JSON-RPC messages (gateway headers, the MCP
+        // bridge key) at debug/trace; cap it at info for this turn, whatever
+        // RUST_LOG says.
+        let turn = tracing::instrument::WithSubscriber::with_subscriber(
+            run_turn(
+                transport,
+                self.kind,
+                self.policy.clone(),
+                TurnInput {
+                    cwd,
+                    mcp_servers,
+                    prompt,
+                    session_mode: self.session_mode.clone(),
+                    cancel_grace: self.cancel_grace,
+                    gateway: GatewayAuth::from_env(
+                        self.kind,
+                        allowed_adapter_env(self.kind, std::env::vars()),
+                    ),
+                },
+                ev_tx,
+                Arc::clone(&cancel),
+            ),
+            acp_capped_dispatch(),
         );
         tokio::pin!(turn);
         let deadline = tokio::time::sleep(Duration::from_secs(self.message_timeout_secs));
