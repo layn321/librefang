@@ -397,6 +397,7 @@ const GW_HEADERS: &str = "x-litellm-api-key: sk-fake-test-value\nX-Lane: acp-tes
 #[tokio::test]
 #[serial]
 async fn gateway_env_is_sent_through_authenticate_before_session_new() {
+    clear_oauth_env();
     std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
     std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
     let d = driver("gateway", PermissionPolicy::AllowAll);
@@ -431,6 +432,7 @@ async fn gateway_env_is_sent_through_authenticate_before_session_new() {
 #[tokio::test]
 #[serial]
 async fn gateway_only_agent_without_gateway_env_reports_auth_required() {
+    clear_oauth_env();
     std::env::remove_var("ANTHROPIC_BASE_URL");
     std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
     let d = driver("gateway", PermissionPolicy::AllowAll);
@@ -472,6 +474,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
 #[serial]
 async fn trace_logging_never_contains_gateway_or_mcp_secrets() {
     const MCP_KEY: &str = "mcp-fake-bridge-key";
+    clear_oauth_env();
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_file = token_dir.path().join("oauth_token");
+    std::fs::write(&token_file, format!("{OAUTH_FAKE}\n")).unwrap();
+    std::env::set_var("LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE", &token_file);
+    std::env::set_var("LIBREFANG_ACP_GATEWAY_AUTH", "authenticate");
     let capture = Capture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
@@ -495,6 +503,7 @@ async fn trace_logging_never_contains_gateway_or_mcp_secrets() {
     let result = d.complete(req).await;
     std::env::remove_var("ANTHROPIC_BASE_URL");
     std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+    clear_oauth_env();
     drop(_guard);
 
     let response = result.expect("turn completes");
@@ -517,6 +526,7 @@ async fn trace_logging_never_contains_gateway_or_mcp_secrets() {
         "gateway header value reached the log"
     );
     assert!(!log.contains(MCP_KEY), "MCP bridge key reached the log");
+    assert!(!log.contains(OAUTH_FAKE), "OAuth token reached the log");
 }
 
 /// LOW from the r3 review: an adapter that does not offer `gateway` gets no
@@ -524,6 +534,7 @@ async fn trace_logging_never_contains_gateway_or_mcp_secrets() {
 #[tokio::test]
 #[serial]
 async fn agent_without_gateway_method_falls_back_to_env() {
+    clear_oauth_env();
     std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
     std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
     let d = driver("normal", PermissionPolicy::AllowAll);
@@ -540,5 +551,134 @@ async fn agent_without_gateway_method_falls_back_to_env() {
     assert!(
         !text.contains("|gw_base:"),
         "no authenticate was sent to an agent that did not offer it: {text}"
+    );
+}
+
+/// Fake subscription token; the fake agent only compares it, never prints it.
+const OAUTH_FAKE: &str = "oauth-fake-test-token-0001";
+
+fn clear_oauth_env() {
+    for k in [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE",
+        "LIBREFANG_ACP_GATEWAY_AUTH",
+    ] {
+        std::env::remove_var(k);
+    }
+}
+
+fn passthrough_driver(token_file: &std::path::Path) -> AcpClientDriver {
+    AcpClientDriver::new(AcpAgentKind::ClaudeCode, Some("python3".to_string()))
+        .with_args(vec![
+            fixture(),
+            "passthrough".to_string(),
+            token_file.to_string_lossy().into_owned(),
+        ])
+        .with_permission_policy(PermissionPolicy::AllowAll)
+        .with_message_timeout(30)
+}
+
+/// LiteLLM subscription passthrough (Tank's lab rounds 3-4): with a subscription
+/// token present the default is `passthrough`. The adapter must get the real
+/// `CLAUDE_CODE_OAUTH_TOKEN` (here loaded from the token file), the base URL and the
+/// custom headers through env, and no `authenticate` call, which would make the
+/// adapter swap the token for the `acp-proxy` placeholder. Also captured at TRACE.
+#[tokio::test]
+#[serial]
+async fn passthrough_keeps_oauth_token_and_never_authenticates() {
+    clear_oauth_env();
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_file = token_dir.path().join("oauth_token");
+    std::fs::write(&token_file, format!("{OAUTH_FAKE}\n")).unwrap();
+    std::env::set_var("LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE", &token_file);
+    std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
+    std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let result = passthrough_driver(&token_file)
+        .complete(request("hello passthrough"))
+        .await;
+    drop(guard);
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+    clear_oauth_env();
+
+    let text = result
+        .expect("passthrough turn completes with no authenticate")
+        .text();
+    assert!(text.contains("echo:hello passthrough"), "{text}");
+    assert!(
+        text.contains("|oauth_match:yes"),
+        "OAuth token reached the adapter: {text}"
+    );
+    assert!(
+        text.contains("|placeholder:no"),
+        "no acp-proxy placeholder: {text}"
+    );
+    assert!(text.contains(&format!("|base_url:{GW_BASE}")), "{text}");
+    assert!(text.contains("|custom_headers_env:yes"), "{text}");
+    assert!(
+        !text.contains("|gw_base:"),
+        "authenticate was not sent: {text}"
+    );
+    assert!(!text.contains(OAUTH_FAKE), "token never echoed: {text}");
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(log.contains("ACP gateway auth mode"), "capture saw nothing");
+    assert!(!log.contains(OAUTH_FAKE), "OAuth token reached the log");
+    assert!(
+        !log.contains("sk-fake-test-value"),
+        "gateway header reached the log"
+    );
+}
+
+/// A token set directly in `CLAUDE_CODE_OAUTH_TOKEN` also selects passthrough and
+/// passes the allowlist unchanged.
+#[tokio::test]
+#[serial]
+async fn env_oauth_token_also_selects_passthrough() {
+    clear_oauth_env();
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_file = token_dir.path().join("expected");
+    std::fs::write(&token_file, OAUTH_FAKE).unwrap();
+    std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", OAUTH_FAKE);
+    std::env::set_var("ANTHROPIC_BASE_URL", GW_BASE);
+    std::env::set_var("ANTHROPIC_CUSTOM_HEADERS", GW_HEADERS);
+    let result = passthrough_driver(&token_file)
+        .complete(request("hello env token"))
+        .await;
+    std::env::remove_var("ANTHROPIC_BASE_URL");
+    std::env::remove_var("ANTHROPIC_CUSTOM_HEADERS");
+    clear_oauth_env();
+
+    let text = result.expect("turn completes").text();
+    assert!(text.contains("|oauth_match:yes"), "{text}");
+    assert!(text.contains("|placeholder:no"), "{text}");
+    assert!(!text.contains("|gw_base:"), "{text}");
+}
+
+/// An unreadable token file fails the turn before anything is spawned, naming the
+/// path but no content.
+#[tokio::test]
+#[serial]
+async fn missing_oauth_token_file_fails_closed() {
+    clear_oauth_env();
+    std::env::set_var(
+        "LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE",
+        "/nonexistent/librefang-oauth-token",
+    );
+    let err = driver("normal", PermissionPolicy::AllowAll)
+        .complete(request("hi"))
+        .await
+        .expect_err("must fail");
+    clear_oauth_env();
+    assert!(
+        err.to_string()
+            .contains("cannot read LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE"),
+        "{err}"
     );
 }

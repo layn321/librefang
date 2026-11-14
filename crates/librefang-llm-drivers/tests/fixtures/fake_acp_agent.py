@@ -17,6 +17,9 @@ argv[2] (cancel marker path, `hang` mode only):
                when the client sets clientCapabilities.auth._meta.gateway, and
                refuse session/new with authRequired until `authenticate` ran;
                then behave as `normal` and report what the gateway call carried
+  passthrough  LiteLLM subscription passthrough: also offers `gateway`, but
+               refuses session/new if `authenticate` was called; reports whether
+               CLAUDE_CODE_OAUTH_TOKEN equals the token file at argv[2]
 """
 
 import subprocess
@@ -118,6 +121,12 @@ def handle_prompt(rid, params, state):
         # Header values are echoed only as a yes/no against this process's own env,
         # never as text.
         chunk(sid, "|gw_match:" + ("yes" if headers == env_custom_headers() else "no"))
+    if MODE == "passthrough":
+        expected = open(CANCEL_MARKER).read().strip() if CANCEL_MARKER else None
+        got = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        chunk(sid, "|oauth_match:" + ("yes" if expected and got == expected else "no"))
+        chunk(sid, "|placeholder:" + ("yes" if os.environ.get("ANTHROPIC_AUTH_TOKEN") == "acp-proxy" else "no"))
+        chunk(sid, "|custom_headers_env:" + ("yes" if env_custom_headers() else "no"))
     send({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -157,7 +166,7 @@ def main():
         params = msg.get("params", {})
         if method == "initialize":
             caps = params.get("clientCapabilities", {}) or {}
-            offers_gateway = MODE == "gateway" and \
+            offers_gateway = MODE in ("gateway", "passthrough") and \
                 ((caps.get("auth") or {}).get("_meta") or {}).get("gateway") is True
             methods = [{"id": "gateway", "name": "Custom model gateway",
                         "_meta": {"gateway": {"protocol": "anthropic"}}}] if offers_gateway else []
@@ -167,9 +176,13 @@ def main():
                 "agentInfo": {"name": "fake-acp-agent", "version": "0.0.1"},
                 "authMethods": methods,
             }})
-        elif method == "authenticate" and MODE == "gateway" and params.get("methodId") == "gateway":
+        elif method == "authenticate" and MODE in ("gateway", "passthrough") \
+                and params.get("methodId") == "gateway":
             state["gateway"] = (params.get("_meta") or {}).get("gateway") or {}
             send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method == "session/new" and MODE == "passthrough" and "gateway" in state:
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602,
+                  "message": "authenticate must not be called in passthrough mode"}})
         elif method == "session/new" and MODE == "gateway" and "gateway" not in state:
             send({"jsonrpc": "2.0", "id": rid,
                   "error": {"code": -32000, "message": "Authentication required"}})

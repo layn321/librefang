@@ -54,6 +54,16 @@ pub const CWD_ENV: &str = "LIBREFANG_ACP_CWD";
 /// Unset uses [`AcpAgentKind::default_session_mode`]; an empty value keeps the agent's own mode.
 pub const SESSION_MODE_ENV: &str = "LIBREFANG_ACP_SESSION_MODE";
 
+/// How a configured Anthropic gateway is reached: `authenticate` or `passthrough`.
+pub const GATEWAY_AUTH_ENV: &str = "LIBREFANG_ACP_GATEWAY_AUTH";
+
+/// File holding a Claude subscription OAuth token, read at spawn time into the
+/// adapter's `CLAUDE_CODE_OAUTH_TOKEN` (the way lab workers mount it).
+pub const OAUTH_TOKEN_FILE_ENV: &str = "LIBREFANG_CLAUDE_OAUTH_TOKEN_FILE";
+
+/// The CLI's own subscription-token variable.
+const OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
 /// How long to wait for the agent to acknowledge `session/cancel` before the
 /// process group is killed.
 const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(5);
@@ -560,6 +570,52 @@ impl GatewayAuth {
             .as_object()
             .cloned()
     }
+}
+
+/// How the driver gets gateway credentials to the Claude CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayAuthMode {
+    /// Send the gateway URL and headers through ACP `authenticate`. The adapter
+    /// then sets a placeholder `ANTHROPIC_AUTH_TOKEN` and blanks any OAuth token
+    /// (`dist/acp-agent.js:7299-7311`, `:7343-7347`): fits a key-based gateway.
+    Authenticate,
+    /// Never advertise or call `authenticate`; the CLI reads `ANTHROPIC_BASE_URL`,
+    /// `ANTHROPIC_CUSTOM_HEADERS` and `CLAUDE_CODE_OAUTH_TOKEN` from its env and
+    /// sends the subscription token itself: fits a subscription passthrough gateway.
+    Passthrough,
+}
+
+impl GatewayAuthMode {
+    /// Explicit setting wins; unset defaults to `passthrough` when a subscription
+    /// OAuth token is present (so it is never replaced by a placeholder), else
+    /// `authenticate`.
+    pub fn resolve(raw: Option<&str>, oauth_token_present: bool) -> Result<Self, String> {
+        match raw.map(str::trim).filter(|v| !v.is_empty()) {
+            None if oauth_token_present => Ok(Self::Passthrough),
+            None => Ok(Self::Authenticate),
+            Some("authenticate") => Ok(Self::Authenticate),
+            Some("passthrough") => Ok(Self::Passthrough),
+            Some(other) => Err(format!(
+                "{GATEWAY_AUTH_ENV} must be `authenticate` or `passthrough`, got `{other}`"
+            )),
+        }
+    }
+}
+
+/// Read a subscription token file. Errors name the path, never the content.
+fn read_oauth_token_file(path: &str) -> Result<String, LlmError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        LlmError::Http(format!(
+            "cannot read {OAUTH_TOKEN_FILE_ENV} file '{path}': {e}"
+        ))
+    })?;
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(LlmError::Http(format!(
+            "{OAUTH_TOKEN_FILE_ENV} file '{path}' is empty"
+        )));
+    }
+    Ok(token.to_string())
 }
 
 /// Client capabilities for `initialize`. A gateway turns on
@@ -1123,6 +1179,41 @@ impl LlmDriver for AcpClientDriver {
 
         let (cwd, _scratch) = self.session_cwd()?;
         let mut cmd = self.build_command(&request, &cwd);
+        let env_token_set = std::env::var(OAUTH_TOKEN_VAR).is_ok_and(|v| !v.is_empty());
+        let mut oauth_token_present = env_token_set;
+        if self.kind == AcpAgentKind::ClaudeCode && !env_token_set {
+            if let Some(path) = std::env::var(OAUTH_TOKEN_FILE_ENV)
+                .ok()
+                .filter(|p| !p.is_empty())
+            {
+                // Value goes straight onto the child env; it is never logged.
+                cmd.env(OAUTH_TOKEN_VAR, read_oauth_token_file(&path)?);
+                oauth_token_present = true;
+            }
+        }
+        let gateway = match self.kind {
+            AcpAgentKind::ClaudeCode => {
+                let mode = GatewayAuthMode::resolve(
+                    std::env::var(GATEWAY_AUTH_ENV).ok().as_deref(),
+                    oauth_token_present,
+                )
+                .map_err(LlmError::Http)?;
+                debug!(
+                    agent = label,
+                    ?mode,
+                    oauth_token_present,
+                    "ACP gateway auth mode"
+                );
+                match mode {
+                    GatewayAuthMode::Authenticate => GatewayAuth::from_env(
+                        self.kind,
+                        allowed_adapter_env(self.kind, std::env::vars()),
+                    ),
+                    GatewayAuthMode::Passthrough => None,
+                }
+            }
+            AcpAgentKind::Codex => None,
+        };
         let mut child = cmd.spawn().map_err(|e| {
             LlmError::Http(format!(
                 "ACP adapter '{}' not found or failed to start ({e}). Install it: {}",
@@ -1169,10 +1260,7 @@ impl LlmDriver for AcpClientDriver {
                     prompt,
                     session_mode: self.session_mode.clone(),
                     cancel_grace: self.cancel_grace,
-                    gateway: GatewayAuth::from_env(
-                        self.kind,
-                        allowed_adapter_env(self.kind, std::env::vars()),
-                    ),
+                    gateway,
                 },
                 ev_tx,
                 Arc::clone(&cancel),
@@ -1703,5 +1791,40 @@ mod tests {
         assert_eq!(caps["auth"]["_meta"]["gateway"], serde_json::json!(true));
         let caps = serde_json::to_value(client_capabilities(None)).unwrap();
         assert!(caps["auth"]["_meta"].is_null(), "{caps}");
+    }
+
+    #[test]
+    fn gateway_auth_mode_defaults_to_passthrough_with_oauth_token() {
+        use GatewayAuthMode::*;
+        assert_eq!(GatewayAuthMode::resolve(None, true), Ok(Passthrough));
+        assert_eq!(GatewayAuthMode::resolve(None, false), Ok(Authenticate));
+        assert_eq!(GatewayAuthMode::resolve(Some(" "), true), Ok(Passthrough));
+        assert_eq!(
+            GatewayAuthMode::resolve(Some("authenticate"), true),
+            Ok(Authenticate)
+        );
+        assert_eq!(
+            GatewayAuthMode::resolve(Some("passthrough"), false),
+            Ok(Passthrough)
+        );
+        assert!(GatewayAuthMode::resolve(Some("bogus"), false).is_err());
+    }
+
+    #[test]
+    fn oauth_token_file_errors_never_carry_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "  \n").unwrap();
+        let err = read_oauth_token_file(empty.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("is empty"), "{err}");
+        let full = dir.path().join("tok");
+        std::fs::write(&full, "tok-fake-123\n").unwrap();
+        assert_eq!(
+            read_oauth_token_file(full.to_str().unwrap()).unwrap(),
+            "tok-fake-123"
+        );
+        let missing = dir.path().join("missing");
+        let err = read_oauth_token_file(missing.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("cannot read"), "{err}");
     }
 }
