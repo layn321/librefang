@@ -1,0 +1,1 @@
+New `claude-code-acp` and `codex-acp` providers drive Claude Code and Codex as Agent Client Protocol agents through their ACP adapters, so LibreFang streams a real CLI session instead of a print-mode subprocess. Permission requests are answered by a configurable policy that denies by default and logs every decision.

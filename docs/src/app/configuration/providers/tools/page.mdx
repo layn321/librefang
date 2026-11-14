@@ -13,6 +13,7 @@ This page covers providers that integrate through local assistant tooling or CLI
 - Codex CLI
 - Gemini CLI
 - Qwen Code
+- Claude Code and Codex over ACP
 
 ## CLI logins as first-class default providers
 
@@ -229,3 +230,38 @@ model = "kimi-coder"
 3. No additional LibreFang configuration needed
 
 **Notes:** CLI Provider — LibreFang spawns the `qwen` binary as a subprocess in print mode (`-p`). The driver preserves `QWEN_*` environment variables while stripping other providers' secrets. Supports streaming JSON output from the Qwen Code CLI. No separate API key is needed when using Qwen OAuth authentication.
+
+---
+
+## Claude Code and Codex over ACP
+
+| | |
+|---|---|
+| **Provider IDs** | `claude-code-acp`, `codex-acp` (aliases `claude_code_acp`, `codex_acp`) |
+| **Type** | **CLI Provider** (ACP client) |
+| **Driver** | `acp_client`: LibreFang is the [Agent Client Protocol](https://agentclientprotocol.com) client |
+| **Adapter** | `claude-agent-acp` / `codex-acp` (must be on PATH, or configured) |
+| **Key Required** | No (the CLI uses its own login, or the gateway variables below) |
+
+LibreFang spawns an ACP adapter, which drives the real CLI as a long-lived agent, and talks to it over ACP on stdio: `initialize`, then `session/new` (working directory plus the LibreFang MCP bridge when the agent has tools), then `session/prompt`. `session/update` chunks stream back as text, thinking and tool-phase events; tool calls run inside the agent and are never handed to the LibreFang tool loop. No print or one-shot CLI mode is used.
+
+**Setup:**
+1. Install the CLI you want and log in (`claude`, or `codex`).
+2. Install the adapter:
+   - Claude Code: `npm install -g @agentclientprotocol/claude-agent-acp` (formerly `@zed-industries/claude-code-acp`; its `claude-code-acp` binary also works if you point the path at it).
+   - Codex: `npm install -g @agentclientprotocol/codex-acp`.
+3. Set `[default_model] provider = "claude-code-acp"` (or `"codex-acp"`).
+
+**Configuration:**
+
+| Setting | Effect |
+|---|---|
+| `base_url` (or `[provider_urls] claude-code-acp = "/path/to/adapter"`) | Adapter executable. Wins over the env var below. |
+| `LIBREFANG_CLAUDE_ACP_PATH` / `LIBREFANG_CODEX_ACP_PATH` | Adapter executable when no config value is set. Default `claude-agent-acp` / `codex-acp` on PATH. |
+| `LIBREFANG_CLAUDE_ACP_ARGS` / `LIBREFANG_CODEX_ACP_ARGS` | Extra adapter arguments, whitespace-separated. |
+| `LIBREFANG_ACP_PERMISSION_POLICY` | How `session/request_permission` is answered: `deny-all` (**default**), `allow-all`, or `allow:<kind>,<kind>` using ACP tool kinds (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`). Every decision is logged at `info`. |
+| `LIBREFANG_ACP_CWD` | Working directory sent in `session/new` (default: the daemon's cwd). |
+| `CLAUDE_CODE_EXECUTABLE` | Passed through; the Claude adapter uses it to pick the Claude Code binary. |
+| `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, other `CLAUDE_*` / `ANTHROPIC_*` / `OPENAI_*` / `CODEX_*` | Passed through, so the CLI's model calls can go to a gateway. |
+
+**Notes:** The adapter's environment goes through the same filter as the `claude-code` and `codex-cli` drivers: other providers' API keys and `*_SECRET` / `*_TOKEN` / `*_PASSWORD` variables are removed. The adapter runs in its own process group, and the whole group is killed on timeout or when the request is dropped. If the caller stops reading the stream, the driver sends `session/cancel` first. A `claude-code-acp/<model>` model id sets `ANTHROPIC_MODEL` for the Claude adapter; bare `claude-code-acp` leaves model choice to the CLI.

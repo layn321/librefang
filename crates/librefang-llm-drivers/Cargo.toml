@@ -34,6 +34,8 @@ dirs = { workspace = true }
 rand = { workspace = true }
 jsonwebtoken = { workspace = true }
 libc = "0.2"
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 serial_test = "4"

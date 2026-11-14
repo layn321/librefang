@@ -476,7 +476,7 @@ impl ClaudeCodeDriver {
     /// `Claude Code CLI streaming subprocess exited with error exit_code=1
     /// stderr=` and stalling all inbound traffic for the agent
     /// (live incident 2026-05-19).
-    fn apply_env_filter(&self, cmd: &mut tokio::process::Command) {
+    pub(crate) fn apply_env_filter(&self, cmd: &mut tokio::process::Command) {
         for key in SENSITIVE_ENV_EXACT {
             cmd.env_remove(key);
         }
@@ -642,7 +642,7 @@ impl ClaudeCodeDriver {
     /// for the parent process). Per-agent credential isolation is out of
     /// scope for this helper — if it ever becomes necessary it belongs in
     /// the spawn site, not here.
-    fn ensure_home_env(cmd: &mut tokio::process::Command) {
+    pub(crate) fn ensure_home_env(cmd: &mut tokio::process::Command) {
         // Spawned CLI resolves `~` via `$HOME` on Unix and `%USERPROFILE%`
         // on Windows. Override only the platform-relevant variable; the
         // other one is either ignored by the CLI or already correct.

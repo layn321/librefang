@@ -331,7 +331,7 @@ impl CodexCliDriver {
     }
 
     /// Apply security env filtering to a command.
-    fn apply_env_filter(cmd: &mut tokio::process::Command) {
+    pub(crate) fn apply_env_filter(cmd: &mut tokio::process::Command) {
         for key in SENSITIVE_ENV_EXACT {
             cmd.env_remove(key);
         }
